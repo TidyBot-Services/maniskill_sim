@@ -59,9 +59,8 @@ class SimState:
     gripper_closed: bool = False
     gripper_object_detected: bool = False
 
-    # Camera (latest obs)
-    camera_rgb: object = None   # numpy HxWx3 uint8
-    camera_depth: object = None # numpy HxWx1 int16
+    # Camera (latest obs) — keyed by camera name
+    cameras: dict = None  # {cam_name: {"rgb": np.array, "depth": np.array}}
 
     # Timestamp
     timestamp: float = 0.0
@@ -136,8 +135,7 @@ class ManiskillServer:
                 gripper_position_mm=self._state.gripper_position_mm,
                 gripper_closed=self._state.gripper_closed,
                 gripper_object_detected=self._state.gripper_object_detected,
-                camera_rgb=self._state.camera_rgb,
-                camera_depth=self._state.camera_depth,
+                cameras=self._state.cameras,
                 timestamp=self._state.timestamp,
             )
 
@@ -287,21 +285,20 @@ class ManiskillServer:
         gripper_mm = float(max(85.0 * (1.0 - gripper_qpos / 0.81), 0.0))
 
         # Camera data from obs (nested: sensor_data/<cam_name>/rgb|depth)
-        camera_rgb = None
-        camera_depth = None
+        cameras = {}
         if isinstance(obs, dict) and "sensor_data" in obs:
             sd = obs["sensor_data"]
-            # Prefer wrist_camera, fall back to first available
-            for cam_name in ("wrist_camera", "base_camera"):
-                if cam_name in sd:
-                    cam = sd[cam_name]
-                    if "rgb" in cam:
-                        t = cam["rgb"]
-                        camera_rgb = t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)
-                    if "depth" in cam:
-                        t = cam["depth"]
-                        camera_depth = t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)
-                    break
+            for cam_name in sd:
+                cam = sd[cam_name]
+                cam_data = {}
+                if "rgb" in cam:
+                    t = cam["rgb"]
+                    cam_data["rgb"] = t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)
+                if "depth" in cam:
+                    t = cam["depth"]
+                    cam_data["depth"] = t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)
+                if cam_data:
+                    cameras[cam_name] = cam_data
 
         with self._state_lock:
             self._state.base_x = float(base[0])
@@ -318,8 +315,7 @@ class ManiskillServer:
             self._state.gripper_position_mm = gripper_mm
             self._state.gripper_closed = gripper_closed
             self._state.gripper_object_detected = False
-            self._state.camera_rgb = camera_rgb
-            self._state.camera_depth = camera_depth
+            self._state.cameras = cameras
             self._state.timestamp = time.time()
 
         with self._obs_lock:
