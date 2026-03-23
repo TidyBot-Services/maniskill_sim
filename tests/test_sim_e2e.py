@@ -108,7 +108,7 @@ def run_tests(keep_alive=False):
     env["PYTHONUNBUFFERED"] = "1"
 
     # -- 1. Launch ManiSkill server --
-    print("\n[1/6] Launching ManiSkill server...")
+    print("\n[1/8] Launching ManiSkill server...")
     sim_proc = subprocess.Popen(
         [python, "-m", "maniskill_server", "--task", "RoboCasaKitchen-v1"],
         cwd=_MANISKILL_DIR,
@@ -152,7 +152,7 @@ def run_tests(keep_alive=False):
     time.sleep(3)
 
     # -- 2. Launch agent server --
-    print(f"\n[2/6] Launching agent server on port {PORT}...")
+    print(f"\n[2/8] Launching agent server on port {PORT}...")
     agent_env = env.copy()
     agent_env["ROBOT_SERVER_URL"] = SERVER_URL
     agent_proc = subprocess.Popen(
@@ -175,7 +175,7 @@ def run_tests(keep_alive=False):
     lease_id = None
     try:
         # -- 3. Check connectivity --
-        print("\n[3/6] Checking connectivity...")
+        print("\n[3/8] Checking connectivity...")
         health = request("GET", "/health")
         backends = health.get("backends", {})
         print(f"  Backends: {json.dumps(backends)}")
@@ -190,7 +190,7 @@ def run_tests(keep_alive=False):
             print("  WARN: expected 2 cameras, got", len(cam_list))
 
         # -- 4. Acquire lease and run test code --
-        print("\n[4/6] Running test code...")
+        print("\n[4/8] Running test code (with lease)...")
         lease_resp = request("POST", "/lease/acquire", {"holder": "e2e_test"})
         lease_id = lease_resp.get("lease_id")
         print(f"  Lease: {lease_id}")
@@ -281,8 +281,111 @@ else:
             print("  FAIL: Test 3")
             passed = False
 
-        # -- 5. Check recordings --
-        print("\n[5/6] Checking recordings...")
+        # -- 5. Release lease before submit tests --
+        if lease_id:
+            try:
+                request("POST", "/lease/release", {"lease_id": lease_id})
+                print("\n  Lease released for submit tests")
+            except Exception:
+                pass
+            lease_id = None
+
+        # -- 5. Test job queue (fire-and-forget submit) --
+        print("\n[5/8] Testing job queue (POST /code/submit)...")
+
+        # Submit 3 jobs concurrently
+        job_ids = []
+        submit_codes = [
+            ('read_state', """
+from robot_sdk import sensors
+joints = sensors.get_arm_joints()
+print(f"joints: {len(joints)}")
+print("SUBMIT_TEST_1_PASSED")
+"""),
+            ('move_arm', """
+from robot_sdk import arm, sensors
+import time
+joints = sensors.get_arm_joints()
+target = list(joints)
+target[3] += 0.05
+arm.move_joints(target, timeout=10)
+time.sleep(0.3)
+new_joints = sensors.get_arm_joints()
+delta = abs(new_joints[3] - joints[3])
+print(f"delta: {delta:.4f}")
+if delta > 0.005:
+    print("SUBMIT_TEST_2_PASSED")
+else:
+    print("SUBMIT_TEST_2_FAILED")
+"""),
+            ('read_base', """
+from robot_sdk import sensors
+pose = sensors.get_base_pose()
+print(f"base: x={pose[0]:.3f} y={pose[1]:.3f}")
+print("SUBMIT_TEST_3_PASSED")
+"""),
+        ]
+
+        for name, code in submit_codes:
+            resp = request("POST", "/code/submit", {
+                "code": code,
+                "holder": f"e2e_{name}",
+                "timeout": 30,
+            })
+            jid = resp.get("job_id", "")
+            pos = resp.get("position", -1)
+            print(f"  Submitted {name}: job_id={jid} position={pos}")
+            job_ids.append((name, jid))
+
+        # Poll until all jobs complete
+        print("  Waiting for jobs to complete...", end="", flush=True)
+        deadline = time.time() + 180  # 3 min max for all jobs
+        while time.time() < deadline:
+            jobs_resp = request("GET", "/code/jobs")
+            all_jobs = jobs_resp.get("jobs", [])
+            our_jobs = [j for j in all_jobs if j["job_id"] in [jid for _, jid in job_ids]]
+            pending = [j for j in our_jobs if j["status"] in ("queued", "running")]
+            if not pending:
+                break
+            print(".", end="", flush=True)
+            time.sleep(2)
+        print(" done")
+
+        # Check results
+        for name, jid in job_ids:
+            detail = request("GET", f"/code/jobs/{jid}")
+            status = detail.get("status", "unknown")
+            result_obj = detail.get("result") or {}
+            stdout = result_obj.get("stdout", "")
+            marker = f"SUBMIT_TEST_{job_ids.index((name, jid)) + 1}_PASSED"
+            ok = marker in stdout
+            print(f"  {name}: status={status} passed={ok}")
+            if stdout.strip():
+                for line in stdout.strip().split("\n"):
+                    print(f"    | {line}")
+            if not ok:
+                err = result_obj.get("stderr", "") or detail.get("error", "")
+                if err:
+                    print(f"    stderr: {err[:200]}")
+                print(f"  FAIL: submit test {name}")
+                passed = False
+
+        # -- 6. Check job queue stats --
+        print("\n[6/8] Checking job queue stats...")
+        jobs_resp = request("GET", "/code/jobs", {"holder": None})
+        summary = jobs_resp.get("summary", {})
+        print(f"  Total: {summary.get('total', 0)}, "
+              f"Completed: {summary.get('completed', 0)}, "
+              f"Failed: {summary.get('failed', 0)}, "
+              f"Success rate: {summary.get('success_rate', 'N/A')}")
+
+        if summary.get("total", 0) >= 3 and summary.get("success_rate") is not None:
+            print("  Job queue stats: OK")
+        else:
+            print("  WARN: unexpected job queue stats")
+
+        # -- 7. Check recordings --
+        print("\n[7/8] Checking recordings...")
         time.sleep(3)  # let recorder flush
         recordings = request("GET", "/code/recordings")
         rec_list = recordings.get("recordings", [])
@@ -305,8 +408,8 @@ else:
         else:
             print("  WARN: no recordings found")
 
-        # -- 6. Summary --
-        print("\n[6/6] Summary")
+        # -- 8. Summary --
+        print("\n[8/8] Summary")
         if passed:
             print("  ALL TESTS PASSED")
         else:
@@ -325,6 +428,17 @@ else:
                 print("  Lease released")
             except Exception:
                 pass
+
+        # Wait for any remaining submit jobs to finish
+        try:
+            for _ in range(30):
+                jobs_resp = request("GET", "/code/jobs")
+                pending = [j for j in jobs_resp.get("jobs", []) if j["status"] in ("queued", "running")]
+                if not pending:
+                    break
+                time.sleep(2)
+        except Exception:
+            pass
 
         if keep_alive:
             print(f"\n  Servers still running (sim PID={sim_proc.pid}, agent PID={agent_proc.pid})")
