@@ -480,12 +480,21 @@ class ManiskillServer:
 
         goal = MPPose(p=target_p, q=target_q)
 
+        import time as _time
+        t0 = _time.time()
+        print(f"[plan] target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) "
+              f"quat=({target_q[0]:.2f},{target_q[1]:.2f},{target_q[2]:.2f},{target_q[3]:.2f}) "
+              f"mask={mask} base=({qpos[0]:.3f},{qpos[1]:.3f},{qpos[2]:.3f})")
         try:
             result = planner.plan_pose(goal, qpos, mask=m, planning_time=10.0)
         except Exception as e:
+            dt = _time.time() - t0
+            print(f"[plan] ERROR ({dt:.2f}s): {e}")
             return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
+        dt = _time.time() - t0
 
         if result['status'] != 'Success':
+            print(f"[plan] FAILED ({dt:.2f}s): {result['status']}")
             return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
 
         traj = result['position']  # (N, 10) active joints: base3 + arm7
@@ -494,6 +503,10 @@ class ManiskillServer:
         padded = np.column_stack([
             traj, np.tile(gripper_vals, (traj.shape[0], 1))
         ])
+        base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
+        print(f"[plan] OK ({dt:.2f}s): {traj.shape[0]} waypoints, "
+              f"base_travel={base_travel:.3f}m, "
+              f"base_end=({traj[-1,0]:.3f},{traj[-1,1]:.3f},{traj[-1,2]:.3f})")
         return {
             "status": "success",
             "trajectory": padded.tolist(),
@@ -564,15 +577,22 @@ class ManiskillServer:
         qpos = self.robot.get_qpos()[0].cpu().numpy()
         goal = MPPose(p=target_p, q=target_q)
 
+        import time as _time
+        t0 = _time.time()
         try:
             status, solutions = planner.IK(goal, qpos, mask=m, n_init_qpos=40,
                                            return_closest=True)
         except Exception as e:
+            dt = _time.time() - t0
+            print(f"[ik] ERROR ({dt:.2f}s): {e}")
             return {"status": f"error: {e}", "qpos": []}
+        dt = _time.time() - t0
 
         if solutions is None:
+            print(f"[ik] no_solution ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
             return {"status": "no_solution", "qpos": []}
 
+        print(f"[ik] OK ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
         return {"status": "success", "qpos": solutions.tolist()}
 
     def _cmd_perceive(self, camera_names=None, target_names=None,
@@ -684,6 +704,10 @@ class ManiskillServer:
                 "mask_pixels": p.mask_pixels,
                 "aspect_ratio": round(p.aspect_ratio, 2),
             })
+
+        names = [r["name"] for r in results]
+        print(f"[perceive] {len(results)} objects from {camera_names}: {names[:10]}"
+              f"{'...' if len(names) > 10 else ''}")
 
         return {
             "objects": results,
