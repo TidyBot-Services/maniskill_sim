@@ -403,6 +403,193 @@ class ManiskillServer:
         self._update_state(obs)
         return True
 
+    # -- Motion planning (lazy-init) -----------------------------------------
+
+    _planner = None
+    _planner_pw = None
+    _fixture_box_names = []
+
+    def _ensure_planner(self):
+        """Lazy-init SapienPlanner on first use (must be called on physics thread)."""
+        if self._planner is not None:
+            return
+
+        import signal
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), '..', 'maniskill_tidyverse'))
+        import planning_utils  # noqa: monkey-patch
+        from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
+
+        scene = self.env.unwrapped.scene.sub_scenes[0]
+        robot = self.robot._objs[0]
+
+        print("[planner] Creating SapienPlanningWorld...")
+        pw = SapienPlanningWorld(scene, [robot])
+        eef = next(n for n in pw.get_planned_articulations()[0]
+                   .get_pinocchio_model().get_link_names() if 'eef' in n)
+        planner = SapienPlanner(pw, move_group=eef)
+
+        # Add fixture AABB boxes if RoboCasa scene
+        try:
+            fixtures = self.env.unwrapped.scene_builder.scene_data[0]['fixtures']
+            from planning_utils import add_fixture_boxes_to_planner, build_kitchen_acm
+            self._fixture_box_names = add_fixture_boxes_to_planner(
+                pw, scene, fixtures)
+            # Relaxed ACM — fixture articulation meshes ignored, boxes checked
+            build_kitchen_acm(pw, planner, mode='relaxed')
+            print(f"[planner] Added {len(self._fixture_box_names)} fixture boxes")
+        except Exception as e:
+            print(f"[planner] No fixtures (non-kitchen scene): {e}")
+
+        self._planner = planner
+        self._planner_pw = pw
+        print("[planner] Ready")
+
+    def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body"):
+        """Plan a collision-free trajectory to a target EE pose.
+
+        Args:
+            target_pose: [x, y, z] target EE position in world frame
+            target_quat: [w, x, y, z] target EE orientation (default: top-down)
+            mask: "whole_body" or "arm_only"
+
+        Returns:
+            dict with keys: status, trajectory (list of qpos lists), waypoint_count
+        """
+        from mplib import Pose as MPPose
+        from planning_utils import sync_planner
+
+        self._ensure_planner()
+        planner = self._planner
+
+        target_p = np.array(target_pose, dtype=float)
+        if target_quat is None:
+            target_q = np.array([0, 1, 0, 0], dtype=float)  # top-down
+        else:
+            target_q = np.array(target_quat, dtype=float)
+
+        # Mask: which joints are locked
+        if mask == "arm_only":
+            m = np.array([True] * 3 + [False] * 7 + [True] * 6)
+        else:
+            m = np.array([False] * 3 + [False] * 7 + [True] * 6)
+
+        # Sync planner with current sim state
+        sync_planner(planner)
+        qpos = self.robot.get_qpos()[0].cpu().numpy()
+
+        goal = MPPose(p=target_p, q=target_q)
+
+        try:
+            result = planner.plan_pose(goal, qpos, mask=m, planning_time=10.0)
+        except Exception as e:
+            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
+
+        if result['status'] != 'Success':
+            return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
+
+        traj = result['position']  # (N, 10) active joints: base3 + arm7
+        # Pad with current gripper values to make full 16-DOF qpos
+        gripper_vals = qpos[QPOS_GRIPPER_SLICE]
+        padded = np.column_stack([
+            traj, np.tile(gripper_vals, (traj.shape[0], 1))
+        ])
+        return {
+            "status": "success",
+            "trajectory": padded.tolist(),
+            "waypoint_count": padded.shape[0],
+        }
+
+    def _cmd_plan_joint(self, target_qpos):
+        """Plan a collision-free trajectory to target joint positions.
+
+        Args:
+            target_qpos: full qpos (16 values: base3 + arm7 + gripper6)
+
+        Returns:
+            dict with keys: status, trajectory, waypoint_count
+        """
+        from planning_utils import sync_planner
+
+        self._ensure_planner()
+        planner = self._planner
+
+        sync_planner(planner)
+        qpos = self.robot.get_qpos()[0].cpu().numpy()
+        target = np.array(target_qpos, dtype=float)
+
+        try:
+            result = planner.plan_qpos([target], qpos, planning_time=10.0)
+        except Exception as e:
+            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
+
+        if result['status'] != 'Success':
+            return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
+
+        traj = result['position']
+        gripper_vals = qpos[QPOS_GRIPPER_SLICE]
+        padded = np.column_stack([
+            traj, np.tile(gripper_vals, (traj.shape[0], 1))
+        ])
+        return {
+            "status": "success",
+            "trajectory": padded.tolist(),
+            "waypoint_count": padded.shape[0],
+        }
+
+    def _cmd_plan_ik(self, target_pose, target_quat=None, mask="whole_body"):
+        """Solve IK for a target EE pose without planning a path.
+
+        Returns:
+            dict with keys: status, qpos (16 values or empty)
+        """
+        from mplib import Pose as MPPose
+        from planning_utils import sync_planner
+
+        self._ensure_planner()
+        planner = self._planner
+
+        target_p = np.array(target_pose, dtype=float)
+        if target_quat is None:
+            target_q = np.array([0, 1, 0, 0], dtype=float)
+        else:
+            target_q = np.array(target_quat, dtype=float)
+
+        if mask == "arm_only":
+            m = np.array([True] * 3 + [False] * 7 + [True] * 6)
+        else:
+            m = np.array([False] * 3 + [False] * 7 + [True] * 6)
+
+        sync_planner(planner)
+        qpos = self.robot.get_qpos()[0].cpu().numpy()
+        goal = MPPose(p=target_p, q=target_q)
+
+        try:
+            status, solutions = planner.IK(goal, qpos, mask=m, n_init_qpos=40,
+                                           return_closest=True)
+        except Exception as e:
+            return {"status": f"error: {e}", "qpos": []}
+
+        if solutions is None:
+            return {"status": "no_solution", "qpos": []}
+
+        return {"status": "success", "qpos": solutions.tolist()}
+
+    def _cmd_evaluate(self):
+        """Check task success via the env's _check_success() or evaluate()."""
+        env = self.env.unwrapped
+        result = {"task": self.task, "success": False}
+        if hasattr(env, "_check_success"):
+            result["success"] = bool(env._check_success())
+            result["source"] = "_check_success"
+        else:
+            eval_result = env.evaluate()
+            result["success"] = bool(eval_result.get("success", False))
+            result["eval"] = {k: bool(v) if isinstance(v, (bool, np.bool_)) else v
+                              for k, v in eval_result.items()}
+            result["source"] = "evaluate"
+        return result
+
     # -- Init & main loop --------------------------------------------------
 
     def _init_env(self):
@@ -411,6 +598,10 @@ class ManiskillServer:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import tidyverse_agent  # noqa: registers 'tidyverse'
         import mani_skill.envs   # noqa: registers envs
+        try:
+            import robocasa_tasks  # noqa: registers RoboCasa single-stage tasks
+        except ImportError:
+            pass
         import gymnasium as gym
 
         render_mode = "human" if self.has_renderer else None
@@ -456,6 +647,104 @@ class ManiskillServer:
             bridge.stop()
         self._bridges.clear()
 
+    def _start_http_api(self):
+        """Start a simple HTTP API on port 5500 for task-level queries."""
+        import json as _json
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+
+        server_ref = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/task/success":
+                    try:
+                        result = server_ref.submit_command("evaluate")
+                        body = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body = _json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
+                elif self.path == "/task/info":
+                    body = _json.dumps({"task": server_ref.task}).encode()
+                    self.send_response(200)
+                else:
+                    body = b'{"error": "not found"}'
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                try:
+                    data = _json.loads(body)
+                except _json.JSONDecodeError:
+                    data = {}
+
+                if self.path == "/plan":
+                    try:
+                        result = server_ref.submit_command(
+                            "plan",
+                            target_pose=data.get("target_pose"),
+                            target_quat=data.get("target_quat"),
+                            mask=data.get("mask", "whole_body"),
+                        )
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/plan/joint":
+                    try:
+                        result = server_ref.submit_command(
+                            "plan_joint",
+                            target_qpos=data.get("target_qpos"),
+                        )
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/plan/ik":
+                    try:
+                        result = server_ref.submit_command(
+                            "plan_ik",
+                            target_pose=data.get("target_pose"),
+                            target_quat=data.get("target_quat"),
+                            mask=data.get("mask", "whole_body"),
+                        )
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/reset":
+                    try:
+                        seed = data.get("seed")
+                        server_ref.submit_command("reset", seed=seed)
+                        body_out = b'{"status": "ok"}'
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                else:
+                    body_out = b'{"error": "not found"}'
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body_out)
+
+            def log_message(self, format, *args):
+                pass  # suppress access logs
+
+        httpd = HTTPServer(("0.0.0.0", 5500), Handler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        print("[maniskill] HTTP API on port 5500 (/task/success, /task/info, /plan, /plan/joint, /plan/ik, /reset)")
+
     def run(self):
         """Main loop: init env, step physics, process commands.
 
@@ -464,6 +753,7 @@ class ManiskillServer:
         self._init_env()
         self._running = True
         self.start_bridges()
+        self._start_http_api()
 
         print("[maniskill] Entering physics loop (Ctrl+C to stop)")
         step_interval = 1.0 / PHYSICS_RATE
