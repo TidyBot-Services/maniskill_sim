@@ -3,7 +3,7 @@
 # Default environment
 DEFAULT_TASK = "PushCube-v1"
 DEFAULT_CONTROL_MODE = "whole_body"
-DEFAULT_OBS_MODE = "rgbd"
+DEFAULT_OBS_MODE = "rgb+depth+segmentation"
 
 # Physics loop rate (Hz)
 PHYSICS_RATE = 20

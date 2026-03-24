@@ -575,6 +575,122 @@ class ManiskillServer:
 
         return {"status": "success", "qpos": solutions.tolist()}
 
+    def _cmd_perceive(self, camera_names=None, target_names=None,
+                       min_pixels=50, max_depth_mm=5000):
+        """Perceive objects using depth + segmentation cameras.
+
+        Runs the full perception pipeline on the physics thread:
+        segmentation → ID lookup → depth back-projection → world-frame positions.
+
+        Args:
+            camera_names: list of camera names to use (default: all available)
+            target_names: if set, only detect these object names
+            min_pixels: minimum mask area to consider
+            max_depth_mm: max depth in mm
+
+        Returns:
+            dict with keys: objects (list of dicts), camera_names, count
+        """
+        from perception import perceive_objects, classify_fixture_context
+
+        # Get fresh observation with current state
+        qpos = self.robot.get_qpos()[0].cpu().numpy()
+        action = np.zeros(ACTION_DIM, dtype=np.float32)
+        action[ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
+        action[ACTION_GRIPPER_IDX] = qpos[QPOS_GRIPPER_SLICE][0]
+        action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
+        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
+        obs, _, _, _, _ = self.env.step(action_tensor)
+
+        # Check segmentation is available
+        sensor_data = obs.get("sensor_data", {})
+        if not sensor_data:
+            return {"objects": [], "count": 0, "error": "no sensor data in obs"}
+
+        first_cam = next(iter(sensor_data))
+        if "segmentation" not in sensor_data[first_cam]:
+            return {"objects": [], "count": 0,
+                    "error": "segmentation not in obs — restart server with "
+                             "--obs-mode rgb+depth+segmentation"}
+
+        # Get fixtures for context classification
+        fixtures = {}
+        try:
+            fixtures = self.env.unwrapped.scene_builder.scene_data[0]['fixtures']
+        except Exception:
+            pass
+
+        # Get arm base position for distance sorting
+        arm_base = None
+        try:
+            arm_base = next(
+                l for l in self.robot.get_links()
+                if l.get_name() == 'panda_link0'
+            ).pose.p[0].cpu().numpy()
+        except Exception:
+            pass
+
+        # Run perception on requested cameras
+        if camera_names is None:
+            camera_names = list(sensor_data.keys())
+
+        all_objects = []
+        seen_names = set()
+        target_set = set(target_names) if target_names else None
+
+        for cam_name in camera_names:
+            if cam_name not in sensor_data:
+                continue
+            perceptions = perceive_objects(
+                obs, self.env.unwrapped, camera_name=cam_name,
+                min_pixels=min_pixels, max_depth_mm=max_depth_mm,
+                target_names=target_set, skip_filter=False,
+            )
+            for p in perceptions:
+                if fixtures:
+                    p.fixture_context = classify_fixture_context(
+                        p.center_3d, fixtures)
+                if p.name not in seen_names:
+                    seen_names.add(p.name)
+                    all_objects.append(p)
+                else:
+                    # Keep the one with more pixels
+                    for j, existing in enumerate(all_objects):
+                        if existing.name == p.name and p.mask_pixels > existing.mask_pixels:
+                            all_objects[j] = p
+                            break
+
+        # Sort by distance to arm base
+        if arm_base is not None:
+            all_objects.sort(
+                key=lambda p: float(np.linalg.norm(p.center_3d - arm_base)))
+
+        # Serialize to JSON-safe dicts
+        results = []
+        for p in all_objects:
+            center = p.center_3d
+            size = p.size_3d
+            dist = float(np.linalg.norm(center - arm_base)) if arm_base is not None else -1
+            results.append({
+                "name": p.name,
+                "x": float(center[0]),
+                "y": float(center[1]),
+                "z": float(center[2]),
+                "size_x": float(size[0]),
+                "size_y": float(size[1]),
+                "size_z": float(size[2]),
+                "distance_m": round(dist, 4),
+                "fixture_context": p.fixture_context or "unknown",
+                "mask_pixels": p.mask_pixels,
+                "aspect_ratio": round(p.aspect_ratio, 2),
+            })
+
+        return {
+            "objects": results,
+            "count": len(results),
+            "cameras": camera_names,
+        }
+
     def _cmd_evaluate(self):
         """Check task success via the env's _check_success() or evaluate()."""
         env = self.env.unwrapped
@@ -720,6 +836,20 @@ class ManiskillServer:
                     except Exception as e:
                         body_out = _json.dumps({"status": f"error: {e}"}).encode()
                         self.send_response(500)
+                elif self.path == "/perceive":
+                    try:
+                        result = server_ref.submit_command(
+                            "perceive",
+                            camera_names=data.get("camera_names"),
+                            target_names=data.get("target_names"),
+                            min_pixels=data.get("min_pixels", 50),
+                            max_depth_mm=data.get("max_depth_mm", 5000),
+                        )
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
                 elif self.path == "/reset":
                     try:
                         seed = data.get("seed")
@@ -743,7 +873,7 @@ class ManiskillServer:
         httpd = HTTPServer(("0.0.0.0", 5500), Handler)
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
-        print("[maniskill] HTTP API on port 5500 (/task/success, /task/info, /plan, /plan/joint, /plan/ik, /reset)")
+        print("[maniskill] HTTP API on port 5500 (/task/success, /task/info, /plan, /plan/ik, /perceive, /reset)")
 
     def run(self):
         """Main loop: init env, step physics, process commands.
