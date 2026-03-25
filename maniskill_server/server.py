@@ -415,9 +415,7 @@ class ManiskillServer:
             return
 
         import signal
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), '..', 'maniskill_tidyverse'))
-        import planning_utils  # noqa: monkey-patch
+        import maniskill_tidyverse.planning_utils  # noqa: monkey-patch
         from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
 
         scene = self.env.unwrapped.scene.sub_scenes[0]
@@ -432,7 +430,7 @@ class ManiskillServer:
         # Add fixture AABB boxes if RoboCasa scene
         try:
             fixtures = self.env.unwrapped.scene_builder.scene_data[0]['fixtures']
-            from planning_utils import add_fixture_boxes_to_planner, build_kitchen_acm
+            from maniskill_tidyverse.planning_utils import add_fixture_boxes_to_planner, build_kitchen_acm
             self._fixture_box_names = add_fixture_boxes_to_planner(
                 pw, scene, fixtures)
             # Relaxed ACM — fixture articulation meshes ignored, boxes checked
@@ -457,7 +455,7 @@ class ManiskillServer:
             dict with keys: status, trajectory (list of qpos lists), waypoint_count
         """
         from mplib import Pose as MPPose
-        from planning_utils import sync_planner
+        from maniskill_tidyverse.planning_utils import sync_planner
 
         self._ensure_planner()
         planner = self._planner
@@ -522,7 +520,7 @@ class ManiskillServer:
         Returns:
             dict with keys: status, trajectory, waypoint_count
         """
-        from planning_utils import sync_planner
+        from maniskill_tidyverse.planning_utils import sync_planner
 
         self._ensure_planner()
         planner = self._planner
@@ -557,7 +555,7 @@ class ManiskillServer:
             dict with keys: status, qpos (16 values or empty)
         """
         from mplib import Pose as MPPose
-        from planning_utils import sync_planner
+        from maniskill_tidyverse.planning_utils import sync_planner
 
         self._ensure_planner()
         planner = self._planner
@@ -611,7 +609,7 @@ class ManiskillServer:
         Returns:
             dict with keys: objects (list of dicts), camera_names, count
         """
-        from perception import perceive_objects, classify_fixture_context
+        from maniskill_tidyverse.perception import perceive_objects, classify_fixture_context
 
         # Get fresh observation with current state
         qpos = self.robot.get_qpos()[0].cpu().numpy()
@@ -735,11 +733,10 @@ class ManiskillServer:
     def _init_env(self):
         """Create the ManiSkill3 environment."""
         # Ensure tidyverse agent is registered
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        import tidyverse_agent  # noqa: registers 'tidyverse'
+        import maniskill_tidyverse.tidyverse_agent  # noqa: registers 'tidyverse'
         import mani_skill.envs   # noqa: registers envs
         try:
-            import robocasa_tasks  # noqa: registers RoboCasa single-stage tasks
+            import maniskill_tidyverse.robocasa_tasks  # noqa: registers RoboCasa single-stage tasks
         except ImportError:
             pass
         import gymnasium as gym
