@@ -293,10 +293,10 @@ class ManiskillServer:
                 cam_data = {}
                 if "rgb" in cam:
                     t = cam["rgb"]
-                    cam_data["rgb"] = t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)
+                    cam_data["rgb"] = (t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)).copy()
                 if "depth" in cam:
                     t = cam["depth"]
-                    cam_data["depth"] = t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)
+                    cam_data["depth"] = (t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)).copy()
                 if cam_data:
                     cameras[cam_name] = cam_data
 
@@ -927,8 +927,8 @@ class ManiskillServer:
                 # 4. Update state buffer
                 self._update_state(obs)
 
-                # 5. Handle episode end
-                if terminated.any() or truncated.any():
+                # 5. Handle episode end (only on task success, not truncation)
+                if terminated.any():
                     obs, info = self.env.reset()
                     qpos = self.robot.get_qpos()[0].cpu().numpy()
                     with self._action_lock:
