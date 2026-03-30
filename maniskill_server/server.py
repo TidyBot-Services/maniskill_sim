@@ -59,6 +59,10 @@ class SimState:
     gripper_closed: bool = False
     gripper_object_detected: bool = False
 
+    # Robot world pose (panda_link0 in world frame, for mocap bridge)
+    robot_world_pos: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    robot_world_quat: list = field(default_factory=lambda: [1.0, 0.0, 0.0, 0.0])  # wxyz
+
     # Camera (latest obs) — keyed by camera name
     cameras: dict = None  # {cam_name: {"rgb": np.array, "depth": np.array}}
 
@@ -135,6 +139,8 @@ class ManiskillServer:
                 gripper_position_mm=self._state.gripper_position_mm,
                 gripper_closed=self._state.gripper_closed,
                 gripper_object_detected=self._state.gripper_object_detected,
+                robot_world_pos=list(self._state.robot_world_pos),
+                robot_world_quat=list(self._state.robot_world_quat),
                 cameras=self._state.cameras,
                 timestamp=self._state.timestamp,
             )
@@ -315,6 +321,8 @@ class ManiskillServer:
             self._state.gripper_position_mm = gripper_mm
             self._state.gripper_closed = gripper_closed
             self._state.gripper_object_detected = False
+            self._state.robot_world_pos = arm_base_pos.tolist()
+            self._state.robot_world_quat = arm_base_quat.tolist()
             self._state.cameras = cameras
             self._state.timestamp = time.time()
 
@@ -707,11 +715,14 @@ class ManiskillServer:
         print(f"[perceive] {len(results)} objects from {camera_names}: {names[:10]}"
               f"{'...' if len(names) > 10 else ''}")
 
-        return {
+        resp = {
             "objects": results,
             "count": len(results),
             "cameras": camera_names,
         }
+        if arm_base is not None:
+            resp["arm_base"] = [float(arm_base[0]), float(arm_base[1]), float(arm_base[2])]
+        return resp
 
     def _cmd_evaluate(self):
         """Check task success via the env's _check_success() or evaluate()."""

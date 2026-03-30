@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--no-franka-bridge", action="store_true")
     parser.add_argument("--no-gripper-bridge", action="store_true")
     parser.add_argument("--no-camera-bridge", action="store_true")
+    parser.add_argument("--no-mocap-bridge", action="store_true")
     args = parser.parse_args()
 
     server = ManiskillServer(
@@ -57,6 +58,13 @@ def main():
             server.add_bridge(CameraBridge(server))
         except ImportError:
             print("[maniskill] WARNING: camera_server not installed, skipping camera bridge")
+
+    if not args.no_mocap_bridge:
+        try:
+            from mocap_server.server import MocapBridge
+            server.add_bridge(MocapBridge(server))
+        except ImportError:
+            print("[maniskill] WARNING: mocap_server not installed, skipping mocap bridge")
 
     server.run()
 
