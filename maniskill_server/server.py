@@ -484,6 +484,20 @@ class ManiskillServer:
         sync_planner(planner)
         qpos = self.robot.get_qpos()[0].cpu().numpy()
 
+        # Save planning world viz
+        try:
+            from maniskill_tidyverse.viz_planning_world import save_planning_world
+            viz_dir = "/tmp/planning_viz"
+            os.makedirs(viz_dir, exist_ok=True)
+            if not hasattr(self, '_plan_count'):
+                self._plan_count = 0
+            tag = f"plan_{self._plan_count:04d}"
+            save_planning_world(self._planner_pw, os.path.join(viz_dir, tag))
+            self._plan_count += 1
+            print(f"[plan] Saved planning world viz to {viz_dir}/{tag}.glb")
+        except Exception as e:
+            print(f"[plan] WARNING: viz save failed: {e}")
+
         goal = MPPose(p=target_p, q=target_q)
 
         import time as _time
