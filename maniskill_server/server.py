@@ -827,7 +827,17 @@ class ManiskillServer:
                         body = _json.dumps({"error": str(e)}).encode()
                         self.send_response(500)
                 elif self.path == "/task/info":
-                    body = _json.dumps({"task": server_ref.task}).encode()
+                    info = {"task": server_ref.task}
+                    # Include task language prompt if available
+                    try:
+                        env = server_ref.env.unwrapped
+                        if hasattr(env, 'get_ep_meta'):
+                            ep_meta = env.get_ep_meta()
+                            if "lang" in ep_meta:
+                                info["lang"] = ep_meta["lang"]
+                    except Exception:
+                        pass
+                    body = _json.dumps(info).encode()
                     self.send_response(200)
                 else:
                     body = b'{"error": "not found"}'
