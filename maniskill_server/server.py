@@ -96,12 +96,13 @@ class ManiskillServer:
     """
 
     def __init__(self, task, control_mode="whole_body", obs_mode="rgbd",
-                 has_renderer=False, http_port=5500):
+                 has_renderer=False, http_port=5500, seed=0):
         self.task = task
         self.control_mode = control_mode
         self.obs_mode = obs_mode
         self.has_renderer = has_renderer
         self._http_port = http_port
+        self._seed = seed
 
         self.env = None
         self.robot = None
@@ -780,7 +781,8 @@ class ManiskillServer:
             obs_mode=self.obs_mode,
             render_mode=render_mode,
         )
-        obs, info = self.env.reset(seed=0)
+        obs, info = self.env.reset(seed=self._seed, options={"reconfigure": True})
+        print(f"[maniskill] Env reset with seed={self._seed} (reconfigure=True)")
 
         self.robot = self.env.unwrapped.agent.robot
 

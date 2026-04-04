@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--no-mocap-bridge", action="store_true")
     parser.add_argument("--port-offset", type=int, default=0,
                         help="Shift all ports by N (for running multiple instances)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for scene layout/style (different seeds → different kitchens)")
     args = parser.parse_args()
 
     offset = args.port_offset
@@ -33,6 +35,7 @@ def main():
         obs_mode=args.obs_mode,
         has_renderer=args.gui,
         http_port=5500 + offset,
+        seed=args.seed,
     )
 
     # Register bridges (imported from installed service packages)
