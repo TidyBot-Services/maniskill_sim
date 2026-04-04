@@ -96,11 +96,12 @@ class ManiskillServer:
     """
 
     def __init__(self, task, control_mode="whole_body", obs_mode="rgbd",
-                 has_renderer=False):
+                 has_renderer=False, http_port=5500):
         self.task = task
         self.control_mode = control_mode
         self.obs_mode = obs_mode
         self.has_renderer = has_renderer
+        self._http_port = http_port
 
         self.env = None
         self.robot = None
@@ -926,10 +927,10 @@ class ManiskillServer:
             def log_message(self, format, *args):
                 pass  # suppress access logs
 
-        httpd = HTTPServer(("0.0.0.0", 5500), Handler)
+        httpd = HTTPServer(("0.0.0.0", self._http_port), Handler)
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
-        print("[maniskill] HTTP API on port 5500 (/task/success, /task/info, /plan, /plan/ik, /perceive, /reset)")
+        print(f"[maniskill] HTTP API on port {self._http_port} (/task/success, /task/info, /plan, /plan/ik, /perceive, /reset)")
 
     def run(self):
         """Main loop: init env, step physics, process commands.

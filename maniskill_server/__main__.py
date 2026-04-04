@@ -21,41 +21,48 @@ def main():
     parser.add_argument("--no-gripper-bridge", action="store_true")
     parser.add_argument("--no-camera-bridge", action="store_true")
     parser.add_argument("--no-mocap-bridge", action="store_true")
+    parser.add_argument("--port-offset", type=int, default=0,
+                        help="Shift all ports by N (for running multiple instances)")
     args = parser.parse_args()
+
+    offset = args.port_offset
 
     server = ManiskillServer(
         task=args.task,
         control_mode=args.control_mode,
         obs_mode=args.obs_mode,
         has_renderer=args.gui,
+        http_port=5500 + offset,
     )
 
     # Register bridges (imported from installed service packages)
     if not args.no_franka_bridge:
         try:
             from franka_server.server import FrankaBridge
-            server.add_bridge(FrankaBridge(server))
+            server.add_bridge(FrankaBridge(server,
+                cmd_port=5555 + offset, state_port=5556 + offset, stream_port=5557 + offset))
         except ImportError:
             print("[maniskill] WARNING: franka_server not installed, skipping arm bridge")
 
     if not args.no_gripper_bridge:
         try:
             from gripper_server.server import GripperBridge
-            server.add_bridge(GripperBridge(server))
+            server.add_bridge(GripperBridge(server,
+                cmd_port=5570 + offset, state_port=5571 + offset))
         except ImportError:
             print("[maniskill] WARNING: gripper_server not installed, skipping gripper bridge")
 
     if not args.no_base_bridge:
         try:
             from base_server.server import BaseBridge
-            server.add_bridge(BaseBridge(server))
+            server.add_bridge(BaseBridge(server, port=50000 + offset))
         except ImportError:
             print("[maniskill] WARNING: base_server not installed, skipping base bridge")
 
     if not args.no_camera_bridge:
         try:
             from camera_server.server import CameraBridge
-            server.add_bridge(CameraBridge(server))
+            server.add_bridge(CameraBridge(server, port=5580 + offset))
         except ImportError:
             print("[maniskill] WARNING: camera_server not installed, skipping camera bridge")
 
