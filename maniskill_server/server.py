@@ -402,6 +402,16 @@ class ManiskillServer:
         """Return current state (already available via get_state)."""
         return self.get_state()
 
+    def _cmd_gripper_close(self):
+        """Close the gripper (set target to 0.81)."""
+        self.set_gripper_action(0.81)
+        return True
+
+    def _cmd_gripper_open(self):
+        """Open the gripper (set target to 0.0)."""
+        self.set_gripper_action(GRIPPER_OPEN)
+        return True
+
     def _cmd_reset(self, seed=None):
         """Reset the environment."""
         obs, info = self.env.reset(seed=seed)
@@ -412,6 +422,127 @@ class ManiskillServer:
             self._action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
         self._update_state(obs)
         return True
+
+    def _cmd_teleport(self, obj_name="obj", position=None):
+        """Teleport an object to a new position and report cabinet debug info."""
+        from sapien import Pose as SapienPose
+        env = self.env.unwrapped
+        p = np.array(position, dtype=np.float32)
+
+        for actor in env.scene.get_all_actors():
+            if obj_name in actor.name:
+                actor.set_pose(SapienPose(p=p))
+                for _ in range(10):
+                    env.scene.step()
+                actual = actor.pose.p.tolist()
+
+                # Debug: get cabinet fixture info
+                cab_info = {}
+                try:
+                    from robocasa_tasks.robocasa_utils import _get_fixture_ref
+                    cab = _get_fixture_ref(env, "cab")
+                    if hasattr(cab, 'pos'):
+                        cab_info['pos'] = list(cab.pos)
+                    if hasattr(cab, 'size'):
+                        cab_info['size'] = list(cab.size)
+                    if hasattr(cab, 'get_int_sites'):
+                        sites = cab.get_int_sites(relative=False)
+                        cab_info['int_sites'] = {k: [list(v) for v in vs] for k, vs in sites.items()}
+                except Exception as e:
+                    cab_info['error'] = str(e)
+
+                # Check success
+                success = env._check_success() if hasattr(env, '_check_success') else None
+
+                return {
+                    "actor": actor.name,
+                    "target": position,
+                    "actual": actual,
+                    "cab_info": cab_info,
+                    "success": success,
+                }
+
+        names = [a.name for a in env.scene.get_all_actors()]
+        return {"error": f"Object '{obj_name}' not found", "actors": [n for n in names if 'obj' in n.lower()]}
+
+    def _cmd_draw_axes(self):
+        """Draw origin point and XYZ axes in the scene for debugging."""
+        import sapien
+        scene = self.env.unwrapped.scene.sub_scenes[0]
+
+        # Origin sphere (white, 5cm)
+        b = sapien.ActorBuilder()
+        b.set_scene(scene)
+        b.add_sphere_visual(radius=0.05, material=sapien.render.RenderMaterial(
+            base_color=[1, 1, 1, 1]))
+        b.set_name("origin_marker")
+        b.set_initial_pose(sapien.Pose(p=[0, 0, 0]))
+        b.build_static()
+
+        # X axis (red, 1m long cylinder)
+        b = sapien.ActorBuilder()
+        b.set_scene(scene)
+        b.add_cylinder_visual(radius=0.01, half_length=0.5, material=sapien.render.RenderMaterial(
+            base_color=[1, 0, 0, 1]))
+        b.set_name("x_axis")
+        # Cylinder default is along Z, rotate 90° around Y to align with X
+        import transforms3d
+        q = transforms3d.quaternions.axangle2quat([0, 1, 0], np.pi/2)
+        b.set_initial_pose(sapien.Pose(p=[0.5, 0, 0], q=q))
+        b.build_static()
+
+        # Y axis (green, 1m)
+        b = sapien.ActorBuilder()
+        b.set_scene(scene)
+        b.add_cylinder_visual(radius=0.01, half_length=0.5, material=sapien.render.RenderMaterial(
+            base_color=[0, 1, 0, 1]))
+        b.set_name("y_axis")
+        q = transforms3d.quaternions.axangle2quat([1, 0, 0], np.pi/2)
+        b.set_initial_pose(sapien.Pose(p=[0, 0.5, 0], q=q))
+        b.build_static()
+
+        # Z axis (blue, 1m)
+        b = sapien.ActorBuilder()
+        b.set_scene(scene)
+        b.add_cylinder_visual(radius=0.01, half_length=0.5, material=sapien.render.RenderMaterial(
+            base_color=[0, 0, 1, 1]))
+        b.set_name("z_axis")
+        b.set_initial_pose(sapien.Pose(p=[0, 0, 0.5]))
+        b.build_static()
+
+        # Draw cabinet success bounding box as 6 semi-transparent red faces
+        try:
+            from robocasa_tasks.robocasa_utils import _get_fixture_ref
+            env = self.env.unwrapped
+            cab = _get_fixture_ref(env, "cab")
+            cab_pos = np.array(cab.pos)
+            cab_size = np.array(cab.size)
+            th = 0.05
+
+            # Use custom tight box aligned with cabinet opening
+            half = np.array([0.2, 0.1, cab_size[2] * 0.5])  # x=0.4, y=0.2, z=keep
+            center = np.array([cab_pos[0], cab_pos[1], cab_pos[2]])
+
+            red_t = sapien.render.RenderMaterial(base_color=[1, 0, 0, 0.25])
+
+            # One big box at the center
+            eb = sapien.ActorBuilder()
+            eb.set_scene(scene)
+            eb.add_box_visual(
+                half_size=half.tolist(),
+                material=red_t,
+            )
+            eb.set_name("cab_bbox")
+            eb.set_initial_pose(sapien.Pose(p=center.tolist()))
+            eb.build_static()
+
+            print(f"[debug] Cabinet bbox: center={center.tolist()}, half={half.tolist()}")
+            print(f"[debug] Lower={lower.tolist()}, Upper={upper.tolist()}")
+        except Exception as e:
+            print(f"[debug] Could not draw cab bbox: {e}")
+            import traceback; traceback.print_exc()
+
+        return "Drew origin + XYZ axes + cabinet bbox (red semi-transparent box)"
 
     # -- Motion planning (lazy-init) -----------------------------------------
 
@@ -443,7 +574,7 @@ class ManiskillServer:
             from maniskill_tidyverse.planning_utils import add_fixture_boxes_to_planner, build_kitchen_acm
             self._fixture_box_names = add_fixture_boxes_to_planner(
                 pw, scene, fixtures)
-            # Relaxed ACM — fixture articulation meshes ignored, boxes checked
+            # Relaxed ACM — ignore all fixture collisions
             build_kitchen_acm(pw, planner, mode='relaxed')
             print(f"[planner] Added {len(self._fixture_box_names)} fixture boxes")
         except Exception as e:
@@ -745,6 +876,20 @@ class ManiskillServer:
         env = self.env.unwrapped
         result = {"task": self.task, "success": False}
         if hasattr(env, "_check_success"):
+            # Debug: print object position at evaluation time
+            try:
+                from robocasa_tasks.robocasa_utils import _get_obj_pos, _get_fixture_ref
+                obj_pos = _get_obj_pos(env, "obj")
+                cab = _get_fixture_ref(env, "cab")
+                cab_pos = np.array(cab.pos)
+                cab_size = np.array(cab.size)
+                half = np.array([0.2, 0.1, cab_size[2] * 0.5])
+                lower = cab_pos - half - 0.05
+                upper = cab_pos + half + 0.05
+                inside = bool(np.all(obj_pos >= lower) and np.all(obj_pos <= upper))
+                print(f"[eval] obj={obj_pos.tolist()}, lower={lower.tolist()}, upper={upper.tolist()}, inside={inside}")
+            except Exception as e:
+                print(f"[eval] debug error: {e}")
             result["success"] = bool(env._check_success())
             result["source"] = "_check_success"
         else:
@@ -914,6 +1059,24 @@ class ManiskillServer:
                         seed = data.get("seed")
                         server_ref.submit_command("reset", seed=seed)
                         body_out = b'{"status": "ok"}'
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/draw_axes":
+                    try:
+                        result = server_ref.submit_command("draw_axes")
+                        body_out = _json.dumps({"status": "ok", "result": str(result)}).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/teleport":
+                    try:
+                        obj_name = data.get("object", "obj")
+                        pos = data.get("position", [0, 0, 0])
+                        result = server_ref.submit_command("teleport", obj_name=obj_name, position=pos)
+                        body_out = _json.dumps({"status": "ok", "result": str(result)}).encode()
                         self.send_response(200)
                     except Exception as e:
                         body_out = _json.dumps({"status": f"error: {e}"}).encode()
