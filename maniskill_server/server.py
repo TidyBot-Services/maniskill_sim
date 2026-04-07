@@ -63,6 +63,10 @@ class SimState:
     robot_world_pos: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
     robot_world_quat: list = field(default_factory=lambda: [1.0, 0.0, 0.0, 0.0])  # wxyz
 
+    # EE world pose (for graspgen point cloud construction)
+    ee_world_pos: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    ee_world_quat: list = field(default_factory=lambda: [1.0, 0.0, 0.0, 0.0])  # wxyz
+
     # Camera (latest obs) — keyed by camera name
     cameras: dict = None  # {cam_name: {"rgb": np.array, "depth": np.array}}
 
@@ -143,6 +147,8 @@ class ManiskillServer:
                 gripper_object_detected=self._state.gripper_object_detected,
                 robot_world_pos=list(self._state.robot_world_pos),
                 robot_world_quat=list(self._state.robot_world_quat),
+                ee_world_pos=list(self._state.ee_world_pos),
+                ee_world_quat=list(self._state.ee_world_quat),
                 cameras=self._state.cameras,
                 timestamp=self._state.timestamp,
             )
@@ -325,6 +331,8 @@ class ManiskillServer:
             self._state.gripper_object_detected = False
             self._state.robot_world_pos = arm_base_pos.tolist()
             self._state.robot_world_quat = arm_base_quat.tolist()
+            self._state.ee_world_pos = ee_pos_world.tolist()
+            self._state.ee_world_quat = ee_quat_world.tolist()
             self._state.cameras = cameras
             self._state.timestamp = time.time()
 
@@ -485,7 +493,6 @@ class ManiskillServer:
         b.add_cylinder_visual(radius=0.01, half_length=0.5, material=sapien.render.RenderMaterial(
             base_color=[1, 0, 0, 1]))
         b.set_name("x_axis")
-        # Cylinder default is along Z, rotate 90° around Y to align with X
         import transforms3d
         q = transforms3d.quaternions.axangle2quat([0, 1, 0], np.pi/2)
         b.set_initial_pose(sapien.Pose(p=[0.5, 0, 0], q=q))
@@ -510,39 +517,59 @@ class ManiskillServer:
         b.set_initial_pose(sapien.Pose(p=[0, 0, 0.5]))
         b.build_static()
 
-        # Draw cabinet success bounding box as 6 semi-transparent red faces
         try:
             from robocasa_tasks.robocasa_utils import _get_fixture_ref
             env = self.env.unwrapped
             cab = _get_fixture_ref(env, "cab")
             cab_pos = np.array(cab.pos)
             cab_size = np.array(cab.size)
-            th = 0.05
 
-            # Use custom tight box aligned with cabinet opening
-            half = np.array([0.2, 0.1, cab_size[2] * 0.5])  # x=0.4, y=0.2, z=keep
+            half = np.array([0.2, 0.1, cab_size[2] * 0.5])
             center = np.array([cab_pos[0], cab_pos[1], cab_pos[2]])
 
             red_t = sapien.render.RenderMaterial(base_color=[1, 0, 0, 0.25])
-
-            # One big box at the center
             eb = sapien.ActorBuilder()
             eb.set_scene(scene)
-            eb.add_box_visual(
-                half_size=half.tolist(),
-                material=red_t,
-            )
+            eb.add_box_visual(half_size=half.tolist(), material=red_t)
             eb.set_name("cab_bbox")
             eb.set_initial_pose(sapien.Pose(p=center.tolist()))
             eb.build_static()
 
             print(f"[debug] Cabinet bbox: center={center.tolist()}, half={half.tolist()}")
-            print(f"[debug] Lower={lower.tolist()}, Upper={upper.tolist()}")
         except Exception as e:
             print(f"[debug] Could not draw cab bbox: {e}")
             import traceback; traceback.print_exc()
 
         return "Drew origin + XYZ axes + cabinet bbox (red semi-transparent box)"
+
+    def _cmd_ground_truth_objects(self):
+        """Return ground-truth positions of all task objects (bypasses cameras)."""
+        import numpy as np
+        env = self.env.unwrapped
+        result = []
+        if hasattr(env, 'object_actors'):
+            scene_idx = getattr(env, '_scene_idx_to_be_loaded', 0)
+            obj_dict = env.object_actors.get(scene_idx, {}) if isinstance(env.object_actors, dict) else {}
+            if not obj_dict and hasattr(env.object_actors, '__getitem__'):
+                try:
+                    obj_dict = env.object_actors[scene_idx]
+                except:
+                    obj_dict = {}
+            for name, obj_info in obj_dict.items():
+                actor = obj_info.get("actor") if isinstance(obj_info, dict) else obj_info
+                if actor is not None and hasattr(actor, 'pose'):
+                    pos = actor.pose.p
+                    if hasattr(pos, 'cpu'):
+                        pos = pos.cpu().numpy()
+                    if hasattr(pos, '__len__') and len(pos.shape) > 1:
+                        pos = pos[0]
+                    result.append({
+                        "name": name,
+                        "x": float(pos[0]),
+                        "y": float(pos[1]),
+                        "z": float(pos[2]),
+                    })
+        return {"objects": result, "count": len(result)}
 
     # -- Motion planning (lazy-init) -----------------------------------------
 
@@ -900,11 +927,14 @@ class ManiskillServer:
 
         # Get arm base position for distance sorting
         arm_base = None
+        arm_base_quat = None
         try:
-            arm_base = next(
+            link0 = next(
                 l for l in self.robot.get_links()
                 if l.get_name() == 'panda_link0'
-            ).pose.p[0].cpu().numpy()
+            )
+            arm_base = link0.pose.p[0].cpu().numpy()
+            arm_base_quat = link0.pose.q[0].cpu().numpy()  # wxyz
         except Exception:
             pass
 
@@ -974,6 +1004,11 @@ class ManiskillServer:
         }
         if arm_base is not None:
             resp["arm_base"] = [float(arm_base[0]), float(arm_base[1]), float(arm_base[2])]
+        if arm_base_quat is not None:
+            resp["arm_base_quat"] = [float(q) for q in arm_base_quat]  # wxyz
+        # Include EE world pose (from latest sim state)
+        resp["ee_world_pos"] = [float(x) for x in self._state.ee_world_pos]
+        resp["ee_world_quat"] = [float(q) for q in self._state.ee_world_quat]  # wxyz
         return resp
 
     def _cmd_evaluate(self):
@@ -1265,6 +1300,14 @@ class ManiskillServer:
                         self.send_response(200)
                     except Exception as e:
                         body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/objects/ground_truth":
+                    try:
+                        result = server_ref.submit_command("ground_truth_objects")
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"error": str(e)}).encode()
                         self.send_response(500)
                 else:
                     body_out = b'{"error": "not found"}'
