@@ -549,9 +549,14 @@ class ManiskillServer:
     _planner = None
     _planner_pw = None
     _fixture_box_names = []
+    _curobo = None  # CuroboPlanner instance
 
     def _ensure_planner(self):
-        """Lazy-init SapienPlanner on first use (must be called on physics thread)."""
+        """Lazy-init planner on first use (must be called on physics thread).
+
+        Initializes cuRobo (GPU-accelerated) as primary planner,
+        with mplib as fallback.
+        """
         if self._planner is not None:
             return
 
@@ -562,6 +567,16 @@ class ManiskillServer:
         scene = self.env.unwrapped.scene.sub_scenes[0]
         robot = self.robot._objs[0]
 
+        # Cache base_link home pose so we can convert mplib's local base coords
+        # (qpos[0:3]) to world frame for cuRobo's collision validator
+        try:
+            base_pose = robot.get_pose()
+            self._base_link_home_T = base_pose.to_transformation_matrix()
+            print(f"[planner] base_link home: pos={list(base_pose.p)} q={list(base_pose.q)}")
+        except Exception as e:
+            print(f"[planner] failed to cache base home pose: {e}")
+            self._base_link_home_T = np.eye(4)
+
         print("[planner] Creating SapienPlanningWorld...")
         pw = SapienPlanningWorld(scene, [robot])
         eef = next(n for n in pw.get_planned_articulations()[0]
@@ -569,23 +584,122 @@ class ManiskillServer:
         planner = SapienPlanner(pw, move_group=eef)
 
         # Add fixture AABB boxes if RoboCasa scene
+        # Cache cuboids during mplib setup so cuRobo can reuse them without
+        # re-querying SAPIEN (which perturbs mplib's planning state).
+        self._fixture_cuboids = []
         try:
             fixtures = self.env.unwrapped.scene_builder.scene_data[0]['fixtures']
             from maniskill_tidyverse.planning_utils import add_fixture_boxes_to_planner, build_kitchen_acm
             self._fixture_box_names = add_fixture_boxes_to_planner(
-                pw, scene, fixtures)
+                pw, scene, fixtures, cuboids_out=self._fixture_cuboids)
             # Relaxed ACM — ignore all fixture collisions
             build_kitchen_acm(pw, planner, mode='relaxed')
-            print(f"[planner] Added {len(self._fixture_box_names)} fixture boxes")
+            print(f"[planner] Added {len(self._fixture_box_names)} fixture boxes "
+                  f"(cached {len(self._fixture_cuboids)} cuboids for cuRobo)")
         except Exception as e:
             print(f"[planner] No fixtures (non-kitchen scene): {e}")
 
         self._planner = planner
         self._planner_pw = pw
-        print("[planner] Ready")
+        print("[planner] mplib ready")
+
+        # Initialize cuRobo for whole_body collision-aware planning.
+        # Reuses the cuboid list cached during mplib setup — re-querying SAPIEN
+        # would perturb mplib's planning state and degrade plan quality.
+        try:
+            from maniskill_tidyverse.curobo_planner import CuroboPlanner
+            self._curobo = CuroboPlanner()
+            self._curobo.warmup()
+
+            if self._fixture_cuboids:
+                robot_base = self.robot.get_qpos()[0].cpu().numpy()[:2]
+                self._curobo.set_collision_world(self._fixture_cuboids, robot_pos=robot_base)
+                print(f"[curobo] Loaded {len(self._fixture_cuboids)} cached cuboids")
+            else:
+                print("[curobo] No cuboids cached (non-kitchen scene)")
+        except Exception as e:
+            print(f"[curobo] init failed: {e}")
+            import traceback; traceback.print_exc()
+            self._curobo = None
+
+    def _pad_trajectory(self, traj_10dof: np.ndarray, qpos: np.ndarray) -> np.ndarray:
+        """Pad 10-DOF trajectory (base3+arm7) with current gripper to make 16-DOF."""
+        gripper_vals = qpos[QPOS_GRIPPER_SLICE]
+        return np.column_stack([
+            traj_10dof, np.tile(gripper_vals, (traj_10dof.shape[0], 1))
+        ])
+
+    def _plan_with_curobo(self, target_p, target_q, qpos, mask):
+        """Try planning with cuRobo. Returns result dict or None.
+
+        Only used for whole_body planning — cuRobo's mobile base joints enable
+        collision-aware base+arm trajectory optimization. For arm_only, mplib is
+        used directly since cuRobo can't properly lock base joints.
+        """
+        if self._curobo is None or mask == "arm_only":
+            return None
+
+        current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+
+        traj = self._curobo.plan_pose(current_q, target_p, target_q, lock_base=False)
+        if traj is None:
+            return None
+
+        padded = self._pad_trajectory(traj, qpos)
+        base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
+        print(f"[plan] cuRobo OK: {traj.shape[0]} waypoints, "
+              f"base_travel={base_travel:.3f}m, "
+              f"base_end=({traj[-1,0]:.3f},{traj[-1,1]:.3f},{traj[-1,2]:.3f})")
+        return {
+            "status": "success",
+            "trajectory": padded.tolist(),
+            "waypoint_count": padded.shape[0],
+        }
+
+    def _plan_with_mplib(self, target_p, target_q, qpos, mask):
+        """Fallback planning with mplib."""
+        from mplib import Pose as MPPose
+        from maniskill_tidyverse.planning_utils import sync_planner
+
+        if mask == "arm_only":
+            m = np.array([True] * 3 + [False] * 7 + [True] * 6)
+        else:
+            m = np.array([False] * 3 + [False] * 7 + [True] * 6)
+
+        sync_planner(self._planner)
+        goal = MPPose(p=target_p, q=target_q)
+
+        import time as _time
+        t0 = _time.time()
+        try:
+            result = self._planner.plan_pose(goal, qpos, mask=m, planning_time=10.0)
+        except Exception as e:
+            dt = _time.time() - t0
+            print(f"[plan] mplib ERROR ({dt:.2f}s): {e}")
+            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
+        dt = _time.time() - t0
+
+        if result['status'] != 'Success':
+            print(f"[plan] mplib FAILED ({dt:.2f}s): {result['status']}")
+            return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
+
+        traj = result['position']
+        padded = self._pad_trajectory(traj, qpos)
+        base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
+        print(f"[plan] mplib OK ({dt:.2f}s): {traj.shape[0]} waypoints, "
+              f"base_travel={base_travel:.3f}m, "
+              f"base_end=({traj[-1,0]:.3f},{traj[-1,1]:.3f},{traj[-1,2]:.3f})")
+        return {
+            "status": "success",
+            "trajectory": padded.tolist(),
+            "waypoint_count": padded.shape[0],
+        }
 
     def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body"):
         """Plan a collision-free trajectory to a target EE pose.
+
+        mplib first (preserves working behavior). When mplib fails, fall back
+        to cuRobo (GPU collision-aware planner).
 
         Args:
             target_pose: [x, y, z] target EE position in world frame
@@ -595,11 +709,7 @@ class ManiskillServer:
         Returns:
             dict with keys: status, trajectory (list of qpos lists), waypoint_count
         """
-        from mplib import Pose as MPPose
-        from maniskill_tidyverse.planning_utils import sync_planner
-
         self._ensure_planner()
-        planner = self._planner
 
         target_p = np.array(target_pose, dtype=float)
         if target_quat is None:
@@ -607,64 +717,46 @@ class ManiskillServer:
         else:
             target_q = np.array(target_quat, dtype=float)
 
-        # Mask: which joints are locked
-        if mask == "arm_only":
-            m = np.array([True] * 3 + [False] * 7 + [True] * 6)
-        else:
-            m = np.array([False] * 3 + [False] * 7 + [True] * 6)
-
-        # Sync planner with current sim state
-        sync_planner(planner)
         qpos = self.robot.get_qpos()[0].cpu().numpy()
-
-        # Save planning world viz
-        try:
-            from maniskill_tidyverse.viz_planning_world import save_planning_world
-            viz_dir = "/tmp/planning_viz"
-            os.makedirs(viz_dir, exist_ok=True)
-            if not hasattr(self, '_plan_count'):
-                self._plan_count = 0
-            tag = f"plan_{self._plan_count:04d}"
-            save_planning_world(self._planner_pw, os.path.join(viz_dir, tag))
-            self._plan_count += 1
-            print(f"[plan] Saved planning world viz to {viz_dir}/{tag}.glb")
-        except Exception as e:
-            print(f"[plan] WARNING: viz save failed: {e}")
-
-        goal = MPPose(p=target_p, q=target_q)
-
-        import time as _time
-        t0 = _time.time()
         print(f"[plan] target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) "
               f"quat=({target_q[0]:.2f},{target_q[1]:.2f},{target_q[2]:.2f},{target_q[3]:.2f}) "
               f"mask={mask} base=({qpos[0]:.3f},{qpos[1]:.3f},{qpos[2]:.3f})")
-        try:
-            result = planner.plan_pose(goal, qpos, mask=m, planning_time=10.0)
-        except Exception as e:
-            dt = _time.time() - t0
-            print(f"[plan] ERROR ({dt:.2f}s): {e}")
-            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
-        dt = _time.time() - t0
 
-        if result['status'] != 'Success':
-            print(f"[plan] FAILED ({dt:.2f}s): {result['status']}")
-            return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
+        # mplib plans
+        result = self._plan_with_mplib(target_p, target_q, qpos, mask)
+        if result.get("status") != "success":
+            # mplib failed — try cuRobo as fallback
+            print("[plan] mplib failed, falling back to cuRobo")
+            curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
+            if curobo_result is not None:
+                return curobo_result
+            return result
 
-        traj = result['position']  # (N, 10) active joints: base3 + arm7
-        # Pad with current gripper values to make full 16-DOF qpos
-        gripper_vals = qpos[QPOS_GRIPPER_SLICE]
-        padded = np.column_stack([
-            traj, np.tile(gripper_vals, (traj.shape[0], 1))
-        ])
-        base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
-        print(f"[plan] OK ({dt:.2f}s): {traj.shape[0]} waypoints, "
-              f"base_travel={base_travel:.3f}m, "
-              f"base_end=({traj[-1,0]:.3f},{traj[-1,1]:.3f},{traj[-1,2]:.3f})")
-        return {
-            "status": "success",
-            "trajectory": padded.tolist(),
-            "waypoint_count": padded.shape[0],
-        }
+        # cuRobo validates the base path of whole_body plans (circle footprint)
+        if self._curobo is not None and mask == "whole_body":
+            traj = np.array(result["trajectory"])
+            # Convert local base XY to world frame using cached base_link pose
+            T = self._base_link_home_T
+            R = T[:3, :3]
+            t = T[:3, 3]
+            local_xy = traj[:, :2]  # (T, 2)
+            local_pts = np.column_stack([local_xy, np.zeros(len(local_xy))])
+            world_xy = (R @ local_pts.T).T[:, :2] + t[:2]  # (T, 2)
+            world_base_traj = np.column_stack([world_xy, traj[:, 2]])
+
+            collision, idx, fname = self._curobo.validate_base_path(
+                world_base_traj, target_pos=target_p)
+            if collision:
+                print(f"[plan] cuRobo: base collision at waypoint {idx}/{len(world_base_traj)} "
+                      f"with {fname} — rejecting mplib trajectory")
+                return {
+                    "status": f"base_collision: {fname} at waypoint {idx}",
+                    "trajectory": [],
+                    "waypoint_count": 0,
+                }
+            print(f"[plan] cuRobo: base path validated ({len(world_base_traj)} waypoints clear)")
+
+        return result
 
     def _cmd_plan_joint(self, target_qpos):
         """Plan a collision-free trajectory to target joint positions.
