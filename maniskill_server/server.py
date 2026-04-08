@@ -732,23 +732,36 @@ class ManiskillServer:
                 return curobo_result
             return result
 
-        # cuRobo validates the base path of whole_body plans (circle footprint)
+        # cuRobo validates the base path of whole_body plans (rectangular OBB)
         if self._curobo is not None and mask == "whole_body":
             traj = np.array(result["trajectory"])
-            # Convert local base XY to world frame using cached base_link pose
+            # Convert local base XY/yaw to world frame using cached base_link pose
             T = self._base_link_home_T
             R = T[:3, :3]
             t = T[:3, 3]
             local_xy = traj[:, :2]  # (T, 2)
             local_pts = np.column_stack([local_xy, np.zeros(len(local_xy))])
             world_xy = (R @ local_pts.T).T[:, :2] + t[:2]  # (T, 2)
-            world_base_traj = np.column_stack([world_xy, traj[:, 2]])
+            spawn_yaw = float(np.arctan2(R[1, 0], R[0, 0]))
+            world_yaw = spawn_yaw + traj[:, 2]
+            world_base_traj = np.column_stack([world_xy, world_yaw])
+
+            # Tidybot base OBB matches sim URDF collision box:
+            # center (-0.198, 0), full size 0.733 x 0.523
+            base_box = {
+                "center_xy": [-0.198, 0.0],
+                "half_extents": [0.367, 0.262],
+            }
 
             collision, idx, fname = self._curobo.validate_base_path(
-                world_base_traj, target_pos=target_p)
+                world_base_traj, target_pos=target_p, base_box=base_box)
             if collision:
                 print(f"[plan] cuRobo: base collision at waypoint {idx}/{len(world_base_traj)} "
-                      f"with {fname} — rejecting mplib trajectory")
+                      f"with {fname} — falling back to cuRobo planner")
+                curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
+                if curobo_result is not None and curobo_result.get("status") == "success":
+                    return curobo_result
+                # cuRobo also failed → return collision error
                 return {
                     "status": f"base_collision: {fname} at waypoint {idx}",
                     "trajectory": [],
@@ -1030,7 +1043,87 @@ class ManiskillServer:
         self._action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
 
         self._update_state(obs)
+        self._create_obb_viz()
         print("[maniskill] Environment ready")
+
+    # -- cuRobo OBB visualization --------------------------------------------
+    # Matches the actual base collision box from tidyverse.urdf:
+    #   <collision><origin xyz="-0.198 0 0.309"/><box size="0.733 0.523 0.606"/></collision>
+    _OBB_HALF_EXTENTS = (0.367, 0.262)    # x, y half size in base_link local frame
+    _OBB_CENTER_OFFSET = (-0.198, 0.0)    # local-frame center offset
+    _obb_viz = None
+
+    def _create_obb_viz(self):
+        """Create a transparent red box that follows the base, showing the
+        OBB footprint cuRobo uses for collision validation."""
+        try:
+            import sapien
+            scene = self.env.unwrapped.scene.sub_scenes[0]
+            # DEBUG: dump all robot link world poses + AABBs
+            try:
+                print("[viz-debug] all robot links:")
+                for name, link in self.robot.links_map.items():
+                    p = link.pose.p[0].cpu().numpy()
+                    q = link.pose.q[0].cpu().numpy()
+                    print(f"  {name}: pos=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f}) q=({q[0]:.3f},{q[1]:.3f},{q[2]:.3f},{q[3]:.3f})")
+            except Exception as e:
+                print(f"[viz-debug] dump links failed: {e}")
+            hx, hy = self._OBB_HALF_EXTENTS
+            half = [hx, hy, 0.02]  # thin in Z so it doesn't obscure the scene
+
+            red_t = sapien.render.RenderMaterial(base_color=[1.0, 0.0, 0.0, 0.35])
+
+            eb = sapien.ActorBuilder()
+            eb.set_scene(scene)
+            eb.add_box_visual(half_size=half, material=red_t)
+            eb.set_name("curobo_obb_viz")
+            eb.set_initial_pose(sapien.Pose(p=[0.0, 0.0, 0.05]))
+            self._obb_viz = eb.build_kinematic()
+            print(f"[viz] cuRobo OBB visualization created "
+                  f"({2*hx:.3f}m x {2*hy:.3f}m, red transparent)")
+        except Exception as e:
+            print(f"[viz] Failed to create OBB viz: {e}")
+            self._obb_viz = None
+
+    _obb_debug_count = 0
+
+    def _update_obb_viz(self):
+        """Update OBB box pose to follow base_link each physics step."""
+        if self._obb_viz is None:
+            return
+        try:
+            import sapien
+            # Use the kinematic base_link pose (driven by base_x/y/yaw joints),
+            # not the articulation root which is a fixed spawn pose.
+            base_link = self.robot.links_map["base_link"]
+            pos = base_link.pose.p[0].cpu().numpy()
+            quat = base_link.pose.q[0].cpu().numpy()  # wxyz
+            # Log every 200 physics steps so we can verify it's actually updating
+            self._obb_debug_count += 1
+            if self._obb_debug_count % 200 == 1:
+                qpos = self.robot.get_qpos()[0].cpu().numpy()
+                print(f"[viz-debug] base_link.pose=({pos[0]:.3f},{pos[1]:.3f}) "
+                      f"q=({quat[0]:.3f},{quat[1]:.3f},{quat[2]:.3f},{quat[3]:.3f}) "
+                      f"qpos[0:3]=({qpos[0]:.3f},{qpos[1]:.3f},{qpos[2]:.3f})")
+            # Build rotation matrix from quaternion
+            w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+            R = np.array([
+                [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+                [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+                [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)],
+            ])
+            ox, oy = self._OBB_CENTER_OFFSET
+            offset_local = np.array([ox, oy, 0.0])
+            center_world = R @ offset_local + np.array([float(pos[0]), float(pos[1]), 0.0])
+            yaw = float(np.arctan2(R[1, 0], R[0, 0]))
+            cy = float(np.cos(yaw / 2))
+            sy = float(np.sin(yaw / 2))
+            self._obb_viz.set_pose(sapien.Pose(
+                p=[float(center_world[0]), float(center_world[1]), 0.05],
+                q=[cy, 0.0, 0.0, sy],
+            ))
+        except Exception:
+            pass
 
     def add_bridge(self, bridge):
         """Register a protocol bridge."""
@@ -1212,6 +1305,9 @@ class ManiskillServer:
                     action_np = self._action.copy()
                 action_tensor = torch.tensor(action_np, dtype=torch.float32).unsqueeze(0)
                 obs, reward, terminated, truncated, info = self.env.step(action_tensor)
+
+                # Update OBB viz before render
+                self._update_obb_viz()
 
                 # 3. Render if GUI
                 if self.has_renderer:
