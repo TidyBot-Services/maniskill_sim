@@ -619,8 +619,12 @@ class ManiskillServer:
             from maniskill_tidyverse.planning_utils import add_fixture_boxes_to_planner, build_kitchen_acm
             self._fixture_box_names = add_fixture_boxes_to_planner(
                 pw, scene, fixtures, cuboids_out=self._fixture_cuboids)
-            # Relaxed ACM — ignore all fixture collisions
-            build_kitchen_acm(pw, planner, mode='relaxed')
+            # Strict ACM — check arm + base against all nearby static fixtures.
+            # Articulated fixture meshes (hinges/drawers) are still relaxed
+            # internally because their cluttered geometry produces too many
+            # false collisions. Static fixture bodies (counters, cabinets,
+            # walls) are enforced.
+            build_kitchen_acm(pw, planner, mode='strict')
             print(f"[planner] Added {len(self._fixture_box_names)} fixture boxes "
                   f"(cached {len(self._fixture_cuboids)} cuboids for cuRobo)")
         except Exception as e:
