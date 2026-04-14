@@ -100,26 +100,37 @@ class ManiskillServer:
     """
 
     def __init__(self, task, control_mode="whole_body", obs_mode="rgbd",
-                 has_renderer=False, http_port=5500, seed=0):
+                 has_renderer=False, http_port=5500, seed=0, num_envs=1):
         self.task = task
         self.control_mode = control_mode
         self.obs_mode = obs_mode
         self.has_renderer = has_renderer
         self._http_port = http_port
         self._seed = seed
+        self.num_envs = num_envs
 
         self.env = None
         self.robot = None
 
         self._running = False
-        self._command_queue = Queue()
-        self._state = SimState()
-        self._state_lock = threading.Lock()
         self._bridges = []
 
-        # Shared action buffer — bridges write to their slices
-        self._action = np.zeros(ACTION_DIM, dtype=np.float32)
-        self._action_lock = threading.Lock()
+        # Per-env state, action, and command buffers
+        self._states = [SimState() for _ in range(num_envs)]
+        self._state_locks = [threading.Lock() for _ in range(num_envs)]
+        self._actions = [np.zeros(ACTION_DIM, dtype=np.float32) for _ in range(num_envs)]
+        self._action_locks = [threading.Lock() for _ in range(num_envs)]
+        self._command_queues = [Queue() for _ in range(num_envs)]
+
+        # Backward compat aliases (env 0)
+        self._state = self._states[0]
+        self._state_lock = self._state_locks[0]
+        self._action = self._actions[0]
+        self._action_lock = self._action_locks[0]
+        self._command_queue = self._command_queues[0]
+
+        # Device for action tensors (set after env creation)
+        self._device = torch.device("cpu")
 
         # Latest observation (for camera bridge)
         self._latest_obs = None
@@ -127,30 +138,32 @@ class ManiskillServer:
 
     # -- State access (thread-safe) ----------------------------------------
 
-    def get_state(self) -> SimState:
-        """Return a snapshot of the current state."""
-        with self._state_lock:
+    def get_state(self, env_idx=0) -> SimState:
+        """Return a snapshot of the current state for the given env."""
+        st = self._states[env_idx]
+        lock = self._state_locks[env_idx]
+        with lock:
             return SimState(
-                base_x=self._state.base_x,
-                base_y=self._state.base_y,
-                base_theta=self._state.base_theta,
-                base_vx=self._state.base_vx,
-                base_vy=self._state.base_vy,
-                base_wz=self._state.base_wz,
-                joint_positions=list(self._state.joint_positions),
-                joint_velocities=list(self._state.joint_velocities),
-                ee_pos=list(self._state.ee_pos),
-                ee_ori_mat=list(self._state.ee_ori_mat),
-                gripper_position=self._state.gripper_position,
-                gripper_position_mm=self._state.gripper_position_mm,
-                gripper_closed=self._state.gripper_closed,
-                gripper_object_detected=self._state.gripper_object_detected,
-                robot_world_pos=list(self._state.robot_world_pos),
-                robot_world_quat=list(self._state.robot_world_quat),
-                ee_world_pos=list(self._state.ee_world_pos),
-                ee_world_quat=list(self._state.ee_world_quat),
-                cameras=self._state.cameras,
-                timestamp=self._state.timestamp,
+                base_x=st.base_x,
+                base_y=st.base_y,
+                base_theta=st.base_theta,
+                base_vx=st.base_vx,
+                base_vy=st.base_vy,
+                base_wz=st.base_wz,
+                joint_positions=list(st.joint_positions),
+                joint_velocities=list(st.joint_velocities),
+                ee_pos=list(st.ee_pos),
+                ee_ori_mat=list(st.ee_ori_mat),
+                gripper_position=st.gripper_position,
+                gripper_position_mm=st.gripper_position_mm,
+                gripper_closed=st.gripper_closed,
+                gripper_object_detected=st.gripper_object_detected,
+                robot_world_pos=list(st.robot_world_pos),
+                robot_world_quat=list(st.robot_world_quat),
+                ee_world_pos=list(st.ee_world_pos),
+                ee_world_quat=list(st.ee_world_quat),
+                cameras=st.cameras,
+                timestamp=st.timestamp,
             )
 
     def get_latest_obs(self):
@@ -160,16 +173,16 @@ class ManiskillServer:
 
     # -- Action writing (thread-safe) --------------------------------------
 
-    def set_arm_action(self, targets):
+    def set_arm_action(self, targets, env_idx=0):
         """Set arm targets (7 values: joint positions or EE pose depending on control mode)."""
-        with self._action_lock:
-            self._action[ACTION_ARM_SLICE] = np.asarray(targets, dtype=np.float32)
+        with self._action_locks[env_idx]:
+            self._actions[env_idx][ACTION_ARM_SLICE] = np.asarray(targets, dtype=np.float32)
 
     def set_arm_ee_pose(self, pos, axis_angle):
         """DEPRECATED: kept for compatibility. Uses IK internally."""
         pass
 
-    def cartesian_ik(self, target_pos, current_q=None):
+    def cartesian_ik(self, target_pos, current_q=None, env_idx=0):
         """Compute IK for target world EE position using sim's own Jacobian.
         Returns joint positions (7 values) or None on failure.
         Must be called from physics thread or with robot accessible.
@@ -177,13 +190,13 @@ class ManiskillServer:
         try:
             if self.robot is None:
                 return None
-            state = self.get_state()
+            state = self.get_state(env_idx=env_idx)
             q = np.array(current_q if current_q is not None else state.joint_positions)
             target = np.array(target_pos)
 
             # Get arm base (panda_link0) world position for frame transform
             arm_base = self.robot.links_map["panda_link0"]
-            arm_base_pos = arm_base.pose.p[0].cpu().numpy()
+            arm_base_pos = arm_base.pose.p[env_idx].cpu().numpy()
 
             # Iterative Jacobian IK using finite differences
             for _ in range(100):
@@ -221,30 +234,30 @@ class ManiskillServer:
             print(f"[maniskill] IK failed: {e}")
             return None
 
-    def set_gripper_action(self, value):
+    def set_gripper_action(self, value, env_idx=0):
         """Set gripper target (0.0=open, 0.81=closed)."""
-        with self._action_lock:
-            self._action[ACTION_GRIPPER_IDX] = float(value)
+        with self._action_locks[env_idx]:
+            self._actions[env_idx][ACTION_GRIPPER_IDX] = float(value)
 
-    def set_base_action(self, base_targets):
+    def set_base_action(self, base_targets, env_idx=0):
         """Set base position targets (x, y, yaw)."""
-        with self._action_lock:
-            self._action[ACTION_BASE_SLICE] = np.asarray(base_targets, dtype=np.float32)
+        with self._action_locks[env_idx]:
+            self._actions[env_idx][ACTION_BASE_SLICE] = np.asarray(base_targets, dtype=np.float32)
 
     # -- Command queue (blocking) ------------------------------------------
 
-    def submit_command(self, method, *args, **kwargs):
+    def submit_command(self, method, *args, env_idx=0, **kwargs):
         """Submit a command to the physics thread and wait for completion."""
         future = Future()
-        cmd = Command(method=method, args=args, kwargs=kwargs, future=future)
-        self._command_queue.put(cmd)
+        cmd = Command(method=method, args=args, kwargs={**kwargs, "_env_idx": env_idx}, future=future)
+        self._command_queues[env_idx].put(cmd)
         return future.result(timeout=60)
 
-    def submit_command_async(self, method, *args, **kwargs):
+    def submit_command_async(self, method, *args, env_idx=0, **kwargs):
         """Submit a command without waiting. Returns a Future."""
         future = Future()
-        cmd = Command(method=method, args=args, kwargs=kwargs, future=future)
-        self._command_queue.put(cmd)
+        cmd = Command(method=method, args=args, kwargs={**kwargs, "_env_idx": env_idx}, future=future)
+        self._command_queues[env_idx].put(cmd)
         return future
 
     # -- Internal: state update --------------------------------------------
@@ -259,10 +272,10 @@ class ManiskillServer:
         angle = 2.0 * np.arctan2(norm, w)
         return np.array([x, y, z]) / norm * angle
 
-    def _update_state(self, obs):
-        """Read current state from env/robot and update the state buffer."""
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
-        qvel = self.robot.get_qvel()[0].cpu().numpy()
+    def _update_state(self, obs, env_idx=0):
+        """Read current state from env/robot and update the state buffer for env_idx."""
+        qpos = self.robot.get_qpos()[env_idx].cpu().numpy()
+        qvel = self.robot.get_qvel()[env_idx].cpu().numpy()
 
         # Base
         base = qpos[QPOS_BASE_SLICE]
@@ -274,13 +287,13 @@ class ManiskillServer:
 
         # EE pose in arm-base frame
         ee_world = self.robot.links_map["eef"].pose
-        ee_pos_world = ee_world.p[0].cpu().numpy()
-        ee_quat_world = ee_world.q[0].cpu().numpy()  # wxyz
+        ee_pos_world = ee_world.p[env_idx].cpu().numpy()
+        ee_quat_world = ee_world.q[env_idx].cpu().numpy()  # wxyz
 
         # Get arm base (panda_link0) world pose for frame conversion
         arm_base_link = self.robot.links_map["panda_link0"]
-        arm_base_pos = arm_base_link.pose.p[0].cpu().numpy()
-        arm_base_quat = arm_base_link.pose.q[0].cpu().numpy()  # wxyz
+        arm_base_pos = arm_base_link.pose.p[env_idx].cpu().numpy()
+        arm_base_quat = arm_base_link.pose.q[env_idx].cpu().numpy()  # wxyz
 
         # Convert EE to arm-base frame
         ee_pos_local = self._transform_to_local(
@@ -307,34 +320,36 @@ class ManiskillServer:
                 cam_data = {}
                 if "rgb" in cam:
                     t = cam["rgb"]
-                    cam_data["rgb"] = (t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)).copy()
+                    cam_data["rgb"] = (t[env_idx].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)).copy()
                 if "depth" in cam:
                     t = cam["depth"]
-                    cam_data["depth"] = (t[0].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)).copy()
+                    cam_data["depth"] = (t[env_idx].cpu().numpy() if hasattr(t, 'cpu') else np.asarray(t)).copy()
                 if cam_data:
                     cameras[cam_name] = cam_data
 
-        with self._state_lock:
-            self._state.base_x = float(base[0])
-            self._state.base_y = float(base[1])
-            self._state.base_theta = float(base[2])
-            self._state.base_vx = float(base_vel[0])
-            self._state.base_vy = float(base_vel[1])
-            self._state.base_wz = float(base_vel[2])
-            self._state.joint_positions = arm_q.tolist()
-            self._state.joint_velocities = arm_dq.tolist()
-            self._state.ee_pos = ee_pos_local[:3].tolist()
-            self._state.ee_ori_mat = ee_ori_mat.flatten().tolist()
-            self._state.gripper_position = robotiq_pos
-            self._state.gripper_position_mm = gripper_mm
-            self._state.gripper_closed = gripper_closed
-            self._state.gripper_object_detected = False
-            self._state.robot_world_pos = arm_base_pos.tolist()
-            self._state.robot_world_quat = arm_base_quat.tolist()
-            self._state.ee_world_pos = ee_pos_world.tolist()
-            self._state.ee_world_quat = ee_quat_world.tolist()
-            self._state.cameras = cameras
-            self._state.timestamp = time.time()
+        st = self._states[env_idx]
+        lock = self._state_locks[env_idx]
+        with lock:
+            st.base_x = float(base[0])
+            st.base_y = float(base[1])
+            st.base_theta = float(base[2])
+            st.base_vx = float(base_vel[0])
+            st.base_vy = float(base_vel[1])
+            st.base_wz = float(base_vel[2])
+            st.joint_positions = arm_q.tolist()
+            st.joint_velocities = arm_dq.tolist()
+            st.ee_pos = ee_pos_local[:3].tolist()
+            st.ee_ori_mat = ee_ori_mat.flatten().tolist()
+            st.gripper_position = robotiq_pos
+            st.gripper_position_mm = gripper_mm
+            st.gripper_closed = gripper_closed
+            st.gripper_object_detected = False
+            st.robot_world_pos = arm_base_pos.tolist()
+            st.robot_world_quat = arm_base_quat.tolist()
+            st.ee_world_pos = ee_pos_world.tolist()
+            st.ee_world_quat = ee_quat_world.tolist()
+            st.cameras = cameras
+            st.timestamp = time.time()
 
         with self._obs_lock:
             self._latest_obs = obs
@@ -383,55 +398,72 @@ class ManiskillServer:
     # -- Internal: command processing --------------------------------------
 
     def _process_commands(self):
-        """Drain command queue. Returns True if any commands were processed."""
+        """Drain all per-env command queues. Returns True if any commands were processed."""
         processed = False
-        while True:
-            try:
-                cmd = self._command_queue.get_nowait()
-            except Empty:
-                break
+        for queue in self._command_queues:
+            while True:
+                try:
+                    cmd = queue.get_nowait()
+                except Empty:
+                    break
 
-            processed = True
-            try:
-                fn = getattr(self, f"_cmd_{cmd.method}", None)
-                if fn is None:
-                    raise AttributeError(f"Unknown command: {cmd.method}")
-                result = fn(*cmd.args, **cmd.kwargs)
-                if cmd.future is not None:
-                    cmd.future.set_result(result)
-            except Exception as e:
-                if cmd.future is not None:
-                    cmd.future.set_exception(e)
+                processed = True
+                try:
+                    # Extract _env_idx from kwargs so command handlers can use it
+                    kwargs = dict(cmd.kwargs)
+                    env_idx = kwargs.pop("_env_idx", 0)
+                    fn = getattr(self, f"_cmd_{cmd.method}", None)
+                    if fn is None:
+                        raise AttributeError(f"Unknown command: {cmd.method}")
+                    result = fn(*cmd.args, _env_idx=env_idx, **kwargs)
+                    if cmd.future is not None:
+                        cmd.future.set_result(result)
+                except Exception as e:
+                    if cmd.future is not None:
+                        cmd.future.set_exception(e)
         return processed
 
     # -- Built-in commands (called on physics thread) ----------------------
 
-    def _cmd_get_state(self):
+    def _cmd_get_state(self, _env_idx=0):
         """Return current state (already available via get_state)."""
-        return self.get_state()
+        return self.get_state(env_idx=_env_idx)
 
-    def _cmd_gripper_close(self):
+    def _cmd_gripper_close(self, _env_idx=0):
         """Close the gripper (set target to 0.81)."""
-        self.set_gripper_action(0.81)
+        self.set_gripper_action(0.81, env_idx=_env_idx)
         return True
 
-    def _cmd_gripper_open(self):
+    def _cmd_gripper_open(self, _env_idx=0):
         """Open the gripper (set target to 0.0)."""
-        self.set_gripper_action(GRIPPER_OPEN)
+        self.set_gripper_action(GRIPPER_OPEN, env_idx=_env_idx)
         return True
 
-    def _cmd_reset(self, seed=None):
-        """Reset the environment."""
-        obs, info = self.env.reset(seed=seed)
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
-        with self._action_lock:
-            self._action[ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
-            self._action[ACTION_GRIPPER_IDX] = GRIPPER_OPEN
-            self._action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
-        self._update_state(obs)
+    def _cmd_reset(self, seed=None, _env_idx=0):
+        """Reset one env (GPU mode) or all envs (CPU mode)."""
+        if self.num_envs > 1:
+            # Per-env reset: only reset the requested env
+            obs, info = self.env.reset(
+                seed=seed,
+                options={"env_idx": torch.tensor([_env_idx], device=self._device)},
+            )
+            qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
+            with self._action_locks[_env_idx]:
+                self._actions[_env_idx][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
+                self._actions[_env_idx][ACTION_GRIPPER_IDX] = GRIPPER_OPEN
+                self._actions[_env_idx][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
+            self._update_state(obs, env_idx=_env_idx)
+        else:
+            obs, info = self.env.reset(seed=seed)
+            qpos = self.robot.get_qpos()[0].cpu().numpy()
+            with self._action_locks[0]:
+                self._actions[0][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
+                self._actions[0][ACTION_GRIPPER_IDX] = GRIPPER_OPEN
+                self._actions[0][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
+            self._update_state(obs, env_idx=0)
         return True
 
-    def _cmd_teleport(self, obj_name="obj", position=None):
+    def _cmd_teleport(self, obj_name="obj", position=None, _env_idx=0):
         """Teleport an object to a new position and report cabinet debug info."""
         from sapien import Pose as SapienPose
         env = self.env.unwrapped
@@ -473,7 +505,7 @@ class ManiskillServer:
         names = [a.name for a in env.scene.get_all_actors()]
         return {"error": f"Object '{obj_name}' not found", "actors": [n for n in names if 'obj' in n.lower()]}
 
-    def _cmd_draw_axes(self):
+    def _cmd_draw_axes(self, _env_idx=0):
         """Draw origin point and XYZ axes in the scene for debugging."""
         import sapien
         scene = self.env.unwrapped.scene.sub_scenes[0]
@@ -542,7 +574,7 @@ class ManiskillServer:
 
         return "Drew origin + XYZ axes + cabinet bbox (red semi-transparent box)"
 
-    def _cmd_ground_truth_objects(self):
+    def _cmd_ground_truth_objects(self, _env_idx=0):
         """Return ground-truth positions of all task objects (bypasses cameras)."""
         import numpy as np
         env = self.env.unwrapped
@@ -726,7 +758,7 @@ class ManiskillServer:
             "waypoint_count": padded.shape[0],
         }
 
-    def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body"):
+    def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
         """Plan a collision-free trajectory to a target EE pose.
 
         mplib first (preserves working behavior). When mplib fails, fall back
@@ -748,8 +780,8 @@ class ManiskillServer:
         else:
             target_q = np.array(target_quat, dtype=float)
 
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
-        print(f"[plan] target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) "
+        qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
+        print(f"[plan] env{_env_idx} target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) "
               f"quat=({target_q[0]:.2f},{target_q[1]:.2f},{target_q[2]:.2f},{target_q[3]:.2f}) "
               f"mask={mask} base=({qpos[0]:.3f},{qpos[1]:.3f},{qpos[2]:.3f})")
 
@@ -802,7 +834,7 @@ class ManiskillServer:
 
         return result
 
-    def _cmd_plan_joint(self, target_qpos):
+    def _cmd_plan_joint(self, target_qpos, _env_idx=0):
         """Plan a collision-free trajectory to target joint positions.
 
         Args:
@@ -817,7 +849,7 @@ class ManiskillServer:
         planner = self._planner
 
         sync_planner(planner)
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
+        qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
         target = np.array(target_qpos, dtype=float)
 
         try:
@@ -839,7 +871,7 @@ class ManiskillServer:
             "waypoint_count": padded.shape[0],
         }
 
-    def _cmd_plan_ik(self, target_pose, target_quat=None, mask="whole_body"):
+    def _cmd_plan_ik(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
         """Solve IK for a target EE pose without planning a path.
 
         Returns:
@@ -863,7 +895,7 @@ class ManiskillServer:
             m = np.array([False] * 3 + [False] * 7 + [True] * 6)
 
         sync_planner(planner)
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
+        qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
         goal = MPPose(p=target_p, q=target_q)
 
         import time as _time
@@ -885,7 +917,7 @@ class ManiskillServer:
         return {"status": "success", "qpos": solutions.tolist()}
 
     def _cmd_perceive(self, camera_names=None, target_names=None,
-                       min_pixels=50, max_depth_mm=5000):
+                       min_pixels=50, max_depth_mm=5000, _env_idx=0):
         """Perceive objects using depth + segmentation cameras.
 
         Runs the full perception pipeline on the physics thread:
@@ -902,13 +934,9 @@ class ManiskillServer:
         """
         from maniskill_tidyverse.perception import perceive_objects, classify_fixture_context
 
-        # Get fresh observation with current state
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
-        action = np.zeros(ACTION_DIM, dtype=np.float32)
-        action[ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
-        action[ACTION_GRIPPER_IDX] = qpos[QPOS_GRIPPER_SLICE][0]
-        action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
-        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
+        # Get fresh observation with current state (steps all envs with their current actions)
+        action_batch = np.stack([self._actions[i].copy() for i in range(self.num_envs)])
+        action_tensor = torch.tensor(action_batch, dtype=torch.float32)
         obs, _, _, _, _ = self.env.step(action_tensor)
 
         # Check segmentation is available
@@ -937,8 +965,8 @@ class ManiskillServer:
                 l for l in self.robot.get_links()
                 if l.get_name() == 'panda_link0'
             )
-            arm_base = link0.pose.p[0].cpu().numpy()
-            arm_base_quat = link0.pose.q[0].cpu().numpy()  # wxyz
+            arm_base = link0.pose.p[_env_idx].cpu().numpy()
+            arm_base_quat = link0.pose.q[_env_idx].cpu().numpy()  # wxyz
         except Exception:
             pass
 
@@ -1011,29 +1039,49 @@ class ManiskillServer:
         if arm_base_quat is not None:
             resp["arm_base_quat"] = [float(q) for q in arm_base_quat]  # wxyz
         # Include EE world pose (from latest sim state)
-        resp["ee_world_pos"] = [float(x) for x in self._state.ee_world_pos]
-        resp["ee_world_quat"] = [float(q) for q in self._state.ee_world_quat]  # wxyz
+        st = self._states[_env_idx]
+        resp["ee_world_pos"] = [float(x) for x in st.ee_world_pos]
+        resp["ee_world_quat"] = [float(q) for q in st.ee_world_quat]  # wxyz
         return resp
 
-    def _cmd_evaluate(self):
+    def _cmd_evaluate(self, _env_idx=0):
         """Check task success via the env's _check_success() or evaluate()."""
         env = self.env.unwrapped
         result = {"task": self.task, "success": False}
         if hasattr(env, "_check_success"):
-            # Debug: print object position at evaluation time
+            # Debug: return detailed check info in the response
             try:
-                from robocasa_tasks.robocasa_utils import _get_obj_pos, _get_fixture_ref
+                from robocasa_tasks.robocasa_utils import _get_obj_pos, _get_eef_pos, _get_fixture_ref
                 obj_pos = _get_obj_pos(env, "obj")
-                cab = _get_fixture_ref(env, "cab")
-                cab_pos = np.array(cab.pos)
-                cab_size = np.array(cab.size)
-                half = np.array([0.2, 0.1, cab_size[2] * 0.5])
-                lower = cab_pos - half - 0.05
-                upper = cab_pos + half + 0.05
-                inside = bool(np.all(obj_pos >= lower) and np.all(obj_pos <= upper))
-                print(f"[eval] obj={obj_pos.tolist()}, lower={lower.tolist()}, upper={upper.tolist()}, inside={inside}")
+                eef_pos = _get_eef_pos(env)
+                result["debug"] = {
+                    "obj_pos": obj_pos.tolist(),
+                    "eef_pos": eef_pos.tolist(),
+                    "eef_obj_dist": float(np.linalg.norm(eef_pos - obj_pos)),
+                }
+                # Try to get fixture info for sink task
+                for fix_name in ["sink", "cab"]:
+                    try:
+                        fix = _get_fixture_ref(env, fix_name)
+                        fpos = np.array(fix.pos)
+                        fsize = np.array(fix.size)
+                        half = np.array([0.2, 0.15, fsize[2] * 0.5 + 0.10])
+                        shifted = fpos + np.array([0, 0.05, 0])
+                        lower = shifted - half - 0.05
+                        upper = shifted + half + 0.05
+                        inside = bool(np.all(obj_pos >= lower) and np.all(obj_pos <= upper))
+                        result["debug"][fix_name] = {
+                            "pos": fpos.tolist(),
+                            "size": fsize.tolist(),
+                            "shifted": shifted.tolist(),
+                            "lower": lower.tolist(),
+                            "upper": upper.tolist(),
+                            "inside": inside,
+                        }
+                    except:
+                        pass
             except Exception as e:
-                print(f"[eval] debug error: {e}")
+                result["debug_error"] = str(e)
             result["success"] = bool(env._check_success())
             result["source"] = "_check_success"
         else:
@@ -1060,30 +1108,55 @@ class ManiskillServer:
         render_mode = "human" if self.has_renderer else None
 
         print(f"[maniskill] Creating env: task={self.task}, "
-              f"control_mode={self.control_mode}, obs_mode={self.obs_mode}")
+              f"control_mode={self.control_mode}, obs_mode={self.obs_mode}, "
+              f"num_envs={self.num_envs}")
 
-        self.env = gym.make(
-            self.task,
-            num_envs=1,
+        make_kwargs = dict(
+            id=self.task,
+            num_envs=self.num_envs,
             robot_uids="tidyverse",
             control_mode=self.control_mode,
             obs_mode=self.obs_mode,
             render_mode=render_mode,
         )
+        # num_envs >= 2 requires GPU simulation backend
+        if self.num_envs > 1:
+            make_kwargs["sim_backend"] = "gpu"
+            make_kwargs["sim_config"] = {"spacing": 20}
+        self.env = gym.make(**make_kwargs)
         obs, info = self.env.reset(seed=self._seed, options={"reconfigure": True})
         print(f"[maniskill] Env reset with seed={self._seed} (reconfigure=True)")
 
         self.robot = self.env.unwrapped.agent.robot
 
-        # Initialize action buffer to current state
-        qpos = self.robot.get_qpos()[0].cpu().numpy()
-        self._action[ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
-        self._action[ACTION_GRIPPER_IDX] = GRIPPER_OPEN
-        self._action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
+        # Detect device from env (GPU PhysX puts tensors on CUDA)
+        try:
+            self._device = self.robot.get_qpos().device
+            print(f"[maniskill] Simulation device: {self._device}")
+        except Exception:
+            pass
 
-        self._update_state(obs)
-        self._create_obb_viz()
-        print("[maniskill] Environment ready")
+        # Per-env reset with different seeds so each env gets a unique kitchen layout
+        if self.num_envs > 1:
+            for i in range(self.num_envs):
+                env_seed = self._seed + i * 42
+                obs, info = self.env.reset(
+                    seed=env_seed,
+                    options={"env_idx": torch.tensor([i], device=self._device)},
+                )
+                print(f"[maniskill] env[{i}] reset with seed={env_seed}")
+
+        # Initialize per-env action buffers to current state
+        for i in range(self.num_envs):
+            qpos = self.robot.get_qpos()[i].cpu().numpy()
+            self._actions[i][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
+            self._actions[i][ACTION_GRIPPER_IDX] = GRIPPER_OPEN
+            self._actions[i][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
+            self._update_state(obs, env_idx=i)
+
+        if self.num_envs == 1:
+            self._create_obb_viz()
+        print(f"[maniskill] Environment ready ({self.num_envs} env(s))")
 
     # -- cuRobo OBB visualization --------------------------------------------
     # Matches the actual base collision box from tidyverse.urdf:
@@ -1181,25 +1254,28 @@ class ManiskillServer:
             bridge.stop()
         self._bridges.clear()
 
-    def _start_http_api(self):
-        """Start a simple HTTP API on port 5500 for task-level queries."""
+    def _start_http_api(self, env_idx=0, port=None):
+        """Start a simple HTTP API for task-level queries for one env."""
         import json as _json
         from http.server import HTTPServer, BaseHTTPRequestHandler
 
+        if port is None:
+            port = self._http_port
         server_ref = self
+        eidx = env_idx  # capture for closure
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path == "/task/success":
                     try:
-                        result = server_ref.submit_command("evaluate")
+                        result = server_ref.submit_command("evaluate", env_idx=eidx)
                         body = _json.dumps(result).encode()
                         self.send_response(200)
                     except Exception as e:
                         body = _json.dumps({"error": str(e)}).encode()
                         self.send_response(500)
                 elif self.path == "/task/info":
-                    info = {"task": server_ref.task}
+                    info = {"task": server_ref.task, "env_idx": eidx}
                     # Include task language prompt if available
                     try:
                         env = server_ref.env.unwrapped
@@ -1231,6 +1307,7 @@ class ManiskillServer:
                     try:
                         result = server_ref.submit_command(
                             "plan",
+                            env_idx=eidx,
                             target_pose=data.get("target_pose"),
                             target_quat=data.get("target_quat"),
                             mask=data.get("mask", "whole_body"),
@@ -1244,6 +1321,7 @@ class ManiskillServer:
                     try:
                         result = server_ref.submit_command(
                             "plan_joint",
+                            env_idx=eidx,
                             target_qpos=data.get("target_qpos"),
                         )
                         body_out = _json.dumps(result).encode()
@@ -1255,6 +1333,7 @@ class ManiskillServer:
                     try:
                         result = server_ref.submit_command(
                             "plan_ik",
+                            env_idx=eidx,
                             target_pose=data.get("target_pose"),
                             target_quat=data.get("target_quat"),
                             mask=data.get("mask", "whole_body"),
@@ -1268,6 +1347,7 @@ class ManiskillServer:
                     try:
                         result = server_ref.submit_command(
                             "perceive",
+                            env_idx=eidx,
                             camera_names=data.get("camera_names"),
                             target_names=data.get("target_names"),
                             min_pixels=data.get("min_pixels", 50),
@@ -1281,7 +1361,7 @@ class ManiskillServer:
                 elif self.path == "/reset":
                     try:
                         seed = data.get("seed")
-                        server_ref.submit_command("reset", seed=seed)
+                        server_ref.submit_command("reset", env_idx=eidx, seed=seed)
                         body_out = b'{"status": "ok"}'
                         self.send_response(200)
                     except Exception as e:
@@ -1289,7 +1369,7 @@ class ManiskillServer:
                         self.send_response(500)
                 elif self.path == "/draw_axes":
                     try:
-                        result = server_ref.submit_command("draw_axes")
+                        result = server_ref.submit_command("draw_axes", env_idx=eidx)
                         body_out = _json.dumps({"status": "ok", "result": str(result)}).encode()
                         self.send_response(200)
                     except Exception as e:
@@ -1299,7 +1379,7 @@ class ManiskillServer:
                     try:
                         obj_name = data.get("object", "obj")
                         pos = data.get("position", [0, 0, 0])
-                        result = server_ref.submit_command("teleport", obj_name=obj_name, position=pos)
+                        result = server_ref.submit_command("teleport", env_idx=eidx, obj_name=obj_name, position=pos)
                         body_out = _json.dumps({"status": "ok", "result": str(result)}).encode()
                         self.send_response(200)
                     except Exception as e:
@@ -1307,7 +1387,7 @@ class ManiskillServer:
                         self.send_response(500)
                 elif self.path == "/objects/ground_truth":
                     try:
-                        result = server_ref.submit_command("ground_truth_objects")
+                        result = server_ref.submit_command("ground_truth_objects", env_idx=eidx)
                         body_out = _json.dumps(result).encode()
                         self.send_response(200)
                     except Exception as e:
@@ -1324,10 +1404,10 @@ class ManiskillServer:
             def log_message(self, format, *args):
                 pass  # suppress access logs
 
-        httpd = HTTPServer(("0.0.0.0", self._http_port), Handler)
+        httpd = HTTPServer(("0.0.0.0", port), Handler)
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
-        print(f"[maniskill] HTTP API on port {self._http_port} (/task/success, /task/info, /plan, /plan/ik, /perceive, /reset)")
+        print(f"[maniskill] HTTP API on port {port} (env {env_idx}: /task/success, /task/info, /plan, /perceive, /reset)")
 
     def run(self):
         """Main loop: init env, step physics, process commands.
@@ -1337,20 +1417,24 @@ class ManiskillServer:
         self._init_env()
         self._running = True
         self.start_bridges()
-        self._start_http_api()
+        # Start per-env HTTP APIs
+        for i in range(self.num_envs):
+            self._start_http_api(env_idx=i, port=self._http_port + i * 100)
 
-        print("[maniskill] Entering physics loop (Ctrl+C to stop)")
+        print(f"[maniskill] Entering physics loop ({self.num_envs} env(s), Ctrl+C to stop)")
         step_interval = 1.0 / PHYSICS_RATE
 
         try:
             while self._running:
-                # 1. Process blocking commands
+                # 1. Process blocking commands (all env queues)
                 self._process_commands()
 
-                # 2. Build action tensor and step
-                with self._action_lock:
-                    action_np = self._action.copy()
-                action_tensor = torch.tensor(action_np, dtype=torch.float32).unsqueeze(0)
+                # 2. Build batched action tensor [num_envs, ACTION_DIM] and step
+                action_batch = np.stack([
+                    self._actions[i].copy() for i in range(self.num_envs)
+                ])
+                action_tensor = torch.tensor(action_batch, dtype=torch.float32,
+                                             device=self._device)
                 obs, reward, terminated, truncated, info = self.env.step(action_tensor)
 
                 # Update OBB viz before render
@@ -1360,18 +1444,20 @@ class ManiskillServer:
                 if self.has_renderer:
                     self.env.render()
 
-                # 4. Update state buffer
-                self._update_state(obs)
+                # 4. Update per-env state buffers
+                for i in range(self.num_envs):
+                    self._update_state(obs, env_idx=i)
 
                 # 5. Handle episode end (only on task success, not truncation)
                 if terminated.any():
                     obs, info = self.env.reset()
-                    qpos = self.robot.get_qpos()[0].cpu().numpy()
-                    with self._action_lock:
-                        self._action[ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
-                        self._action[ACTION_GRIPPER_IDX] = GRIPPER_OPEN
-                        self._action[ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
-                    self._update_state(obs)
+                    for i in range(self.num_envs):
+                        qpos = self.robot.get_qpos()[i].cpu().numpy()
+                        with self._action_locks[i]:
+                            self._actions[i][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
+                            self._actions[i][ACTION_GRIPPER_IDX] = GRIPPER_OPEN
+                            self._actions[i][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
+                        self._update_state(obs, env_idx=i)
 
                 # 6. Rate limit
                 time.sleep(step_interval)
