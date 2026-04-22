@@ -675,9 +675,13 @@ class ManiskillServer:
             self._curobo.warmup()
 
             if self._fixture_cuboids:
+                # Transform world-frame fixture AABBs to robot-local frame so
+                # cuRobo's collision world aligns with current_q[:3] (qpos local).
+                local_cuboids = [self._cuboid_world_to_local(c)
+                                 for c in self._fixture_cuboids]
                 robot_base = self.robot.get_qpos()[0].cpu().numpy()[:2]
-                self._curobo.set_collision_world(self._fixture_cuboids, robot_pos=robot_base)
-                print(f"[curobo] Loaded {len(self._fixture_cuboids)} cached cuboids")
+                self._curobo.set_collision_world(local_cuboids, robot_pos=robot_base)
+                print(f"[curobo] Loaded {len(local_cuboids)} cuboids (transformed world→local)")
             else:
                 print("[curobo] No cuboids cached (non-kitchen scene)")
         except Exception as e:
@@ -711,6 +715,39 @@ class ManiskillServer:
         except Exception:
             local_q = np.asarray(world_q, dtype=float)  # fallback: assume R≈I
         return local_p, local_q
+
+    def _cuboid_world_to_local(self, c: dict) -> dict:
+        """Transform a world-frame AABB cuboid dict to the robot's local frame.
+
+        Fixture cuboids from _compute_fixture_aabb come in sapien world coords
+        (since they're derived from actors' world poses). cuRobo's collision
+        world must live in the same frame as current_q[:3] (local), otherwise
+        the planner sees obstacles at wrong positions relative to the robot and
+        happily routes the arm/base through real walls.
+
+        A world AABB has identity orientation. Transforming to local:
+        - center translates via T⁻¹
+        - orientation becomes inverse(base_home_rotation) — so the cuboid is an
+          OBB in local frame when base_home has non-identity yaw. cuRobo handles
+          this via the optional quat_wxyz field.
+        """
+        T = self._base_link_home_T
+        R = T[:3, :3]
+        t = T[:3, 3]
+        center_world = np.asarray(c["center"], dtype=float)
+        center_local = R.T @ (center_world - t)
+        try:
+            from transforms3d.quaternions import mat2quat, qinverse
+            base_q = mat2quat(R)
+            local_q = qinverse(base_q)  # wxyz; orientation of world frame seen from local
+        except Exception:
+            local_q = np.array([1.0, 0.0, 0.0, 0.0])
+        return {
+            "name": c["name"],
+            "center": center_local.tolist(),
+            "half_size": c["half_size"],
+            "quat_wxyz": local_q.tolist() if hasattr(local_q, "tolist") else list(local_q),
+        }
 
     def _plan_with_curobo(self, target_p, target_q, qpos, mask):
         """Try planning with cuRobo. Returns result dict or None.
