@@ -692,18 +692,44 @@ class ManiskillServer:
             traj_10dof, np.tile(gripper_vals, (traj_10dof.shape[0], 1))
         ])
 
+    def _world_pose_to_local(self, world_p: np.ndarray, world_q: np.ndarray):
+        """Transform a world-frame EE pose (pos + wxyz quat) into the robot's
+        local frame (matching qpos[0:3] convention).
+
+        cuRobo's plan_pose / solve_ik need inputs consistent with current_q[:3],
+        which is in local coords (base joint values). Targets from the RPC are
+        world coords, so we invert self._base_link_home_T to bring them local.
+        """
+        T = self._base_link_home_T
+        R = T[:3, :3]
+        t = T[:3, 3]
+        local_p = R.T @ (np.asarray(world_p, dtype=float) - t)
+        try:
+            from transforms3d.quaternions import mat2quat, qmult, qinverse
+            base_q = mat2quat(R)  # wxyz
+            local_q = qmult(qinverse(base_q), np.asarray(world_q, dtype=float))
+        except Exception:
+            local_q = np.asarray(world_q, dtype=float)  # fallback: assume R≈I
+        return local_p, local_q
+
     def _plan_with_curobo(self, target_p, target_q, qpos, mask):
         """Try planning with cuRobo. Returns result dict or None.
 
         Supports both whole_body and arm_only via cuRobo's lock_base
         (dispatches to a second MotionGen with base_x/y/z locked).
+
+        Target pose arrives in world frame (RPC convention); cuRobo's state
+        (current_q[:3]) is in local frame (qpos values), so the target is
+        transformed world→local before being passed in. The returned
+        trajectory is already in local frame (matches the qpos contract).
         """
         if self._curobo is None:
             return None
 
         current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+        target_p_local, target_q_local = self._world_pose_to_local(target_p, target_q)
 
-        traj = self._curobo.plan_pose(current_q, target_p, target_q,
+        traj = self._curobo.plan_pose(current_q, target_p_local, target_q_local,
                                        lock_base=(mask == "arm_only"))
         if traj is None:
             return None
@@ -906,14 +932,16 @@ class ManiskillServer:
         Uses num_seeds=40 + return_closest=True — direct parity with mplib's
         planner.IK(n_init_qpos=40, return_closest=True). arm_only routes to
         cuRobo's arm-only MotionGen with base pinned to current qpos.
+        Target is transformed world→local to match current_q[:3] (qpos) frame.
         """
         if self._curobo is None:
             return None
 
         current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+        target_p_local, target_q_local = self._world_pose_to_local(target_p, target_q)
 
         q_sol = self._curobo.solve_ik(
-            target_p, target_q,
+            target_p_local, target_q_local,
             current_q=current_q,
             lock_base=(mask == "arm_only"),
             num_seeds=40,
