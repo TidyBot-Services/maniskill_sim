@@ -695,22 +695,22 @@ class ManiskillServer:
     def _plan_with_curobo(self, target_p, target_q, qpos, mask):
         """Try planning with cuRobo. Returns result dict or None.
 
-        Only used for whole_body planning — cuRobo's mobile base joints enable
-        collision-aware base+arm trajectory optimization. For arm_only, mplib is
-        used directly since cuRobo can't properly lock base joints.
+        Supports both whole_body and arm_only via cuRobo's lock_base
+        (dispatches to a second MotionGen with base_x/y/z locked).
         """
-        if self._curobo is None or mask == "arm_only":
+        if self._curobo is None:
             return None
 
         current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
 
-        traj = self._curobo.plan_pose(current_q, target_p, target_q, lock_base=False)
+        traj = self._curobo.plan_pose(current_q, target_p, target_q,
+                                       lock_base=(mask == "arm_only"))
         if traj is None:
             return None
 
         padded = self._pad_trajectory(traj, qpos)
         base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
-        print(f"[plan] cuRobo OK: {traj.shape[0]} waypoints, "
+        print(f"[plan] cuRobo OK ({mask}): {traj.shape[0]} waypoints, "
               f"base_travel={base_travel:.3f}m, "
               f"base_end=({traj[-1,0]:.3f},{traj[-1,1]:.3f},{traj[-1,2]:.3f})")
         return {
@@ -761,8 +761,11 @@ class ManiskillServer:
     def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
         """Plan a collision-free trajectory to a target EE pose.
 
-        mplib first (preserves working behavior). When mplib fails, fall back
-        to cuRobo (GPU collision-aware planner).
+        Routing:
+          - cuRobo first (handles whole_body and arm_only via lock_base;
+            the arm_only path uses a second MotionGen with base joints locked)
+          - mplib fallback on cuRobo failure, with OBB base-path validation
+            against RoboCasa fixtures (mplib doesn't know about them)
 
         Args:
             target_pose: [x, y, z] target EE position in world frame
@@ -785,20 +788,21 @@ class ManiskillServer:
               f"quat=({target_q[0]:.2f},{target_q[1]:.2f},{target_q[2]:.2f},{target_q[3]:.2f}) "
               f"mask={mask} base=({qpos[0]:.3f},{qpos[1]:.3f},{qpos[2]:.3f})")
 
-        # mplib plans
+        # Try cuRobo first (handles both whole_body and arm_only).
+        curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
+        if curobo_result is not None and curobo_result.get("status") == "success":
+            return curobo_result
+
+        # cuRobo unavailable or failed — fall back to mplib.
+        print("[plan] cuRobo unavailable/failed, falling back to mplib")
         result = self._plan_with_mplib(target_p, target_q, qpos, mask)
         if result.get("status") != "success":
-            # mplib failed — try cuRobo as fallback
-            print("[plan] mplib failed, falling back to cuRobo")
-            curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
-            if curobo_result is not None:
-                return curobo_result
             return result
 
-        # cuRobo validates the base path of whole_body plans (rectangular OBB)
-        if self._curobo is not None and mask == "whole_body":
+        # Validate mplib's base path against RoboCasa fixture OBBs. mplib
+        # doesn't know about the fixtures; cuRobo has them loaded from setup.
+        if self._curobo is not None:
             traj = np.array(result["trajectory"])
-            # Convert local base XY/yaw to world frame using cached base_link pose
             T = self._base_link_home_T
             R = T[:3, :3]
             t = T[:3, 3]
@@ -809,8 +813,6 @@ class ManiskillServer:
             world_yaw = spawn_yaw + traj[:, 2]
             world_base_traj = np.column_stack([world_xy, world_yaw])
 
-            # Tidybot base OBB matches sim URDF collision box:
-            # center (-0.198, 0), full size 0.733 x 0.523
             base_box = {
                 "center_xy": [-0.198, 0.0],
                 "half_extents": [0.367, 0.262],
@@ -819,23 +821,46 @@ class ManiskillServer:
             collision, idx, fname = self._curobo.validate_base_path(
                 world_base_traj, target_pos=target_p, base_box=base_box)
             if collision:
-                print(f"[plan] cuRobo: base collision at waypoint {idx}/{len(world_base_traj)} "
-                      f"with {fname} — falling back to cuRobo planner")
-                curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
-                if curobo_result is not None and curobo_result.get("status") == "success":
-                    return curobo_result
-                # cuRobo also failed → return collision error
+                print(f"[plan] mplib base path collides at waypoint {idx}/{len(world_base_traj)} "
+                      f"with {fname} — no usable plan")
                 return {
                     "status": f"base_collision: {fname} at waypoint {idx}",
                     "trajectory": [],
                     "waypoint_count": 0,
                 }
-            print(f"[plan] cuRobo: base path validated ({len(world_base_traj)} waypoints clear)")
+            print(f"[plan] mplib base path validated ({len(world_base_traj)} waypoints clear)")
 
         return result
 
+    def _plan_joint_with_curobo(self, target_qpos, qpos):
+        """Try joint-space planning with cuRobo. Returns result dict or None.
+
+        Always whole_body — no mask parameter on this endpoint. Use cuRobo's
+        plan_joints (wraps plan_single_js with start-state clear-retry).
+        """
+        if self._curobo is None:
+            return None
+
+        current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+        target_active = np.concatenate([target_qpos[QPOS_BASE_SLICE],
+                                         target_qpos[QPOS_ARM_SLICE]])
+
+        traj = self._curobo.plan_joints(current_q, target_active, lock_base=False)
+        if traj is None:
+            return None
+
+        padded = self._pad_trajectory(traj, qpos)
+        print(f"[plan_joint] cuRobo OK: {traj.shape[0]} waypoints")
+        return {
+            "status": "success",
+            "trajectory": padded.tolist(),
+            "waypoint_count": padded.shape[0],
+        }
+
     def _cmd_plan_joint(self, target_qpos, _env_idx=0):
         """Plan a collision-free trajectory to target joint positions.
+
+        Routing: cuRobo first, mplib fallback.
 
         Args:
             target_qpos: full qpos (16 values: base3 + arm7 + gripper6)
@@ -846,11 +871,18 @@ class ManiskillServer:
         from maniskill_tidyverse.planning_utils import sync_planner
 
         self._ensure_planner()
-        planner = self._planner
-
-        sync_planner(planner)
         qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
         target = np.array(target_qpos, dtype=float)
+
+        # cuRobo first
+        curobo_result = self._plan_joint_with_curobo(target, qpos)
+        if curobo_result is not None and curobo_result.get("status") == "success":
+            return curobo_result
+
+        # Fallback to mplib
+        print("[plan_joint] cuRobo unavailable/failed, falling back to mplib")
+        planner = self._planner
+        sync_planner(planner)
 
         try:
             result = planner.plan_qpos([target], qpos, planning_time=10.0)
@@ -861,27 +893,48 @@ class ManiskillServer:
             return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
 
         traj = result['position']
-        gripper_vals = qpos[QPOS_GRIPPER_SLICE]
-        padded = np.column_stack([
-            traj, np.tile(gripper_vals, (traj.shape[0], 1))
-        ])
+        padded = self._pad_trajectory(traj, qpos)
         return {
             "status": "success",
             "trajectory": padded.tolist(),
             "waypoint_count": padded.shape[0],
         }
 
+    def _ik_with_curobo(self, target_p, target_q, qpos, mask):
+        """Try IK with cuRobo. Returns result dict or None.
+
+        Uses num_seeds=40 + return_closest=True — direct parity with mplib's
+        planner.IK(n_init_qpos=40, return_closest=True). arm_only routes to
+        cuRobo's arm-only MotionGen with base pinned to current qpos.
+        """
+        if self._curobo is None:
+            return None
+
+        current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+
+        q_sol = self._curobo.solve_ik(
+            target_p, target_q,
+            current_q=current_q,
+            lock_base=(mask == "arm_only"),
+            num_seeds=40,
+            return_closest=True,
+        )
+        if q_sol is None:
+            return None
+        return {"status": "success", "qpos": q_sol.tolist()}
+
     def _cmd_plan_ik(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
         """Solve IK for a target EE pose without planning a path.
 
+        Routing: cuRobo first (num_seeds=40, return_closest=True), mplib fallback.
+
         Returns:
-            dict with keys: status, qpos (16 values or empty)
+            dict with keys: status, qpos (10 values: base3 + arm7, or empty)
         """
         from mplib import Pose as MPPose
         from maniskill_tidyverse.planning_utils import sync_planner
 
         self._ensure_planner()
-        planner = self._planner
 
         target_p = np.array(target_pose, dtype=float)
         if target_quat is None:
@@ -889,13 +942,24 @@ class ManiskillServer:
         else:
             target_q = np.array(target_quat, dtype=float)
 
+        qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
+
+        # cuRobo first
+        curobo_result = self._ik_with_curobo(target_p, target_q, qpos, mask)
+        if curobo_result is not None and curobo_result.get("status") == "success":
+            print(f"[ik] cuRobo OK target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
+            return curobo_result
+
+        # Fallback to mplib
+        print("[ik] cuRobo unavailable/failed, falling back to mplib")
+        planner = self._planner
+
         if mask == "arm_only":
             m = np.array([True] * 3 + [False] * 7 + [True] * 6)
         else:
             m = np.array([False] * 3 + [False] * 7 + [True] * 6)
 
         sync_planner(planner)
-        qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
         goal = MPPose(p=target_p, q=target_q)
 
         import time as _time
@@ -913,7 +977,7 @@ class ManiskillServer:
             print(f"[ik] no_solution ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
             return {"status": "no_solution", "qpos": []}
 
-        print(f"[ik] OK ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
+        print(f"[ik] mplib OK ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
         return {"status": "success", "qpos": solutions.tolist()}
 
     def _cmd_perceive(self, camera_names=None, target_names=None,
@@ -1156,6 +1220,30 @@ class ManiskillServer:
 
         if self.num_envs == 1:
             self._create_obb_viz()
+
+        # Prefetch planner warmup so the first user-triggered plan doesn't pay
+        # the ~9s cuRobo CUDA-kernel warmup cost. Subsequent plans hit a
+        # second ~1.9s JIT cost on the first plan_pose call; trigger it with
+        # one dummy plan against the current robot state.
+        try:
+            self._ensure_planner()
+            if self._curobo is not None:
+                qpos0 = self.robot.get_qpos()[0].cpu().numpy()
+                current_q = np.concatenate([qpos0[QPOS_BASE_SLICE], qpos0[QPOS_ARM_SLICE]])
+                # Target 30cm in front of arm home — trivially reachable,
+                # just to trigger JIT compile of the plan_pose kernel path.
+                import time as _time
+                _t0 = _time.time()
+                self._curobo.plan_pose(
+                    current_q,
+                    target_pos=np.array([0.3, 0.0, 0.5]),
+                    target_quat=np.array([0.0, 1.0, 0.0, 0.0]),
+                    lock_base=False,
+                )
+                print(f"[planner] dummy plan JIT warmup done ({_time.time() - _t0:.1f}s)")
+        except Exception as e:
+            print(f"[planner] prefetch warmup failed: {e}")
+
         print(f"[maniskill] Environment ready ({self.num_envs} env(s))")
 
     # -- cuRobo OBB visualization --------------------------------------------
