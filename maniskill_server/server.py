@@ -716,6 +716,38 @@ class ManiskillServer:
             local_q = np.asarray(world_q, dtype=float)  # fallback: assume R≈I
         return local_p, local_q
 
+    def _validate_base_trajectory(self, trajectory, target_p_world):
+        """Check that a base trajectory (local qpos frame) clears the stored
+        cuboid world (also local, post the world→local cuboid transform).
+
+        Needed because cuRobo's collision world only covers arm+gripper links —
+        base/platform collision is NOT enforced natively (see franka_tidyverse.yml
+        collision_link_names: only panda_link* + attached_object). This validator
+        is the base-side safety net for both cuRobo and mplib plans.
+
+        Args:
+            trajectory: list[list[float]] or ndarray of shape (T, >=3), base
+                xyz joint values in local (qpos) frame
+            target_p_world: world-frame target — converted to local for the
+                exclusion radius inside validate_base_path
+
+        Returns:
+            (collision: bool, waypoint_idx: int, fixture_name: str)
+        """
+        if self._curobo is None or not self._curobo._world_cuboids:
+            return False, -1, ""
+        traj = np.asarray(trajectory, dtype=float)
+        base_traj_local = traj[:, :3]
+        target_local, _ = self._world_pose_to_local(
+            np.asarray(target_p_world, dtype=float),
+            np.array([1.0, 0.0, 0.0, 0.0]))
+        base_box = {
+            "center_xy": [-0.198, 0.0],
+            "half_extents": [0.367, 0.262],
+        }
+        return self._curobo.validate_base_path(
+            base_traj_local, target_pos=target_local, base_box=base_box)
+
     def _cuboid_world_to_local(self, c: dict) -> dict:
         """Transform a world-frame AABB cuboid dict to the robot's local frame.
 
@@ -853,46 +885,44 @@ class ManiskillServer:
 
         # Try cuRobo first (handles both whole_body and arm_only).
         curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
-        if curobo_result is not None and curobo_result.get("status") == "success":
-            return curobo_result
+        fallback_reason = None
+        if curobo_result is None:
+            fallback_reason = "cuRobo unavailable/failed"
+        elif curobo_result.get("status") != "success":
+            fallback_reason = f"cuRobo status={curobo_result.get('status')}"
+        else:
+            # cuRobo only checks arm+gripper against the world, not the mobile
+            # base — always validate the base path before accepting.
+            coll, idx, fname = self._validate_base_trajectory(
+                curobo_result["trajectory"], target_p)
+            if coll:
+                fallback_reason = (
+                    f"cuRobo base path hits {fname} at wp {idx} "
+                    f"(arm-only cuRobo collision check; base needs mplib+validator)"
+                )
+            else:
+                return curobo_result
 
-        # cuRobo unavailable or failed — fall back to mplib.
-        print("[plan] cuRobo unavailable/failed, falling back to mplib")
+        # Fall back to mplib.
+        print(f"[plan] {fallback_reason}, falling back to mplib")
         result = self._plan_with_mplib(target_p, target_q, qpos, mask)
         if result.get("status") != "success":
             return result
 
-        # Validate mplib's base path against RoboCasa fixture OBBs. mplib
-        # doesn't know about the fixtures; cuRobo has them loaded from setup.
-        if self._curobo is not None:
-            traj = np.array(result["trajectory"])
-            T = self._base_link_home_T
-            R = T[:3, :3]
-            t = T[:3, 3]
-            local_xy = traj[:, :2]  # (T, 2)
-            local_pts = np.column_stack([local_xy, np.zeros(len(local_xy))])
-            world_xy = (R @ local_pts.T).T[:, :2] + t[:2]  # (T, 2)
-            spawn_yaw = float(np.arctan2(R[1, 0], R[0, 0]))
-            world_yaw = spawn_yaw + traj[:, 2]
-            world_base_traj = np.column_stack([world_xy, world_yaw])
-
-            base_box = {
-                "center_xy": [-0.198, 0.0],
-                "half_extents": [0.367, 0.262],
+        # Validate mplib's base path too. Both cuRobo and mplib trajectories
+        # live in local (qpos) frame, and cuboids are in local frame after the
+        # world→local cuboid transform in _ensure_planner.
+        coll, idx, fname = self._validate_base_trajectory(result["trajectory"], target_p)
+        if coll:
+            T_wp = len(result["trajectory"])
+            print(f"[plan] mplib base path collides at waypoint {idx}/{T_wp} "
+                  f"with {fname} — no usable plan")
+            return {
+                "status": f"base_collision: {fname} at waypoint {idx}",
+                "trajectory": [],
+                "waypoint_count": 0,
             }
-
-            collision, idx, fname = self._curobo.validate_base_path(
-                world_base_traj, target_pos=target_p, base_box=base_box)
-            if collision:
-                print(f"[plan] mplib base path collides at waypoint {idx}/{len(world_base_traj)} "
-                      f"with {fname} — no usable plan")
-                return {
-                    "status": f"base_collision: {fname} at waypoint {idx}",
-                    "trajectory": [],
-                    "waypoint_count": 0,
-                }
-            print(f"[plan] mplib base path validated ({len(world_base_traj)} waypoints clear)")
-
+        print(f"[plan] mplib base path validated ({len(result['trajectory'])} waypoints clear)")
         return result
 
     def _plan_joint_with_curobo(self, target_qpos, qpos):
