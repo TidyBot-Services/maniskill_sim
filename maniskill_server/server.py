@@ -716,6 +716,48 @@ class ManiskillServer:
             local_q = np.asarray(world_q, dtype=float)  # fallback: assume R≈I
         return local_p, local_q
 
+    # Franka Panda + mobile base joint limits (matches franka_tidyverse.yml
+    # URDF). Small interior margin avoids INVALID_START_STATE_JOINT_LIMITS
+    # when sim physics overshoots a limit by ε (observed bursts during
+    # gripper open/close — controller transients push arm joints to
+    # 3.7526 against cuRobo's 3.7525 cap on panda_joint6).
+    _CUROBO_JOINT_LIMITS = (
+        (-5.0, 5.0),          # base_x
+        (-5.0, 5.0),          # base_y
+        (-6.0, 6.0),          # base_z (yaw)
+        (-2.8973, 2.8973),    # panda_joint1
+        (-1.7628, 1.7628),    # panda_joint2
+        (-2.8973, 2.8973),    # panda_joint3
+        (-3.0718, -0.0698),   # panda_joint4
+        (-2.8973, 2.8973),    # panda_joint5
+        (-0.0175, 3.7525),    # panda_joint6
+        (-2.8973, 2.8973),    # panda_joint7
+    )
+    _CUROBO_CLAMP_MARGIN = 1e-4
+
+    def _build_current_q(self, qpos):
+        """Assemble 10-DOF (base3 + arm7) current_q for cuRobo, clamped to
+        cuRobo's joint limits with a small interior margin. Fixes the
+        INVALID_START_STATE_JOINT_LIMITS bursts caused by sim qpos narrowly
+        exceeding cuRobo's declared limits (ε-level overshoots from
+        controller transients during gripper actuation)."""
+        q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]]).astype(np.float64)
+        margin = self._CUROBO_CLAMP_MARGIN
+        clamped = []
+        for i, (lo, hi) in enumerate(self._CUROBO_JOINT_LIMITS):
+            if q[i] < lo + margin or q[i] > hi - margin:
+                clamped.append((i, float(q[i]), lo, hi))
+                q[i] = max(lo + margin, min(hi - margin, q[i]))
+        if clamped:
+            names = ("base_x", "base_y", "base_z",
+                     "panda_joint1", "panda_joint2", "panda_joint3",
+                     "panda_joint4", "panda_joint5", "panda_joint6",
+                     "panda_joint7")
+            msg = ", ".join(f"{names[i]}={raw:.5f}→[{lo},{hi}]"
+                            for (i, raw, lo, hi) in clamped)
+            print(f"[curobo] clamped {len(clamped)} joint(s) into limits: {msg}")
+        return q
+
     def _validate_base_trajectory(self, trajectory, target_p_world):
         """Check that a base trajectory (local qpos frame) clears the stored
         cuboid world (also local, post the world→local cuboid transform).
@@ -795,7 +837,7 @@ class ManiskillServer:
         if self._curobo is None:
             return None
 
-        current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+        current_q = self._build_current_q(qpos)
         target_p_local, target_q_local = self._world_pose_to_local(target_p, target_q)
 
         traj = self._curobo.plan_pose(current_q, target_p_local, target_q_local,
@@ -934,7 +976,7 @@ class ManiskillServer:
         if self._curobo is None:
             return None
 
-        current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+        current_q = self._build_current_q(qpos)
         target_active = np.concatenate([target_qpos[QPOS_BASE_SLICE],
                                          target_qpos[QPOS_ARM_SLICE]])
 
@@ -1004,7 +1046,7 @@ class ManiskillServer:
         if self._curobo is None:
             return None
 
-        current_q = np.concatenate([qpos[QPOS_BASE_SLICE], qpos[QPOS_ARM_SLICE]])
+        current_q = self._build_current_q(qpos)
         target_p_local, target_q_local = self._world_pose_to_local(target_p, target_q)
 
         q_sol = self._curobo.solve_ik(
@@ -1324,7 +1366,7 @@ class ManiskillServer:
             self._ensure_planner()
             if self._curobo is not None:
                 qpos0 = self.robot.get_qpos()[0].cpu().numpy()
-                current_q = np.concatenate([qpos0[QPOS_BASE_SLICE], qpos0[QPOS_ARM_SLICE]])
+                current_q = self._build_current_q(qpos0)
                 # Target 30cm in front of arm home — trivially reachable,
                 # just to trigger JIT compile of the plan_pose kernel path.
                 import time as _time
