@@ -1245,6 +1245,201 @@ class ManiskillServer:
         resp["ee_world_quat"] = [float(q) for q in st.ee_world_quat]  # wxyz
         return resp
 
+    def _cmd_draw_collision_spheres(self, _env_idx=0):
+        """Render cuRobo's robot collision spheres as yellow transparent spheres in sim.
+
+        Reads the sphere config YAML used by cuRobo (franka_tidyverse_mesh.yml),
+        computes each sphere's current world position from the link pose, and
+        creates a static visual-only sphere at that world location.
+
+        Snapshots current robot pose — call again after the robot moves to refresh.
+        """
+        import sapien
+        import yaml
+        import os
+
+        # Path to cuRobo sphere config
+        candidates = [
+            os.path.expanduser("~/文档/maniskill-tidyverse/curobo_assets/spheres/franka_tidyverse_mesh.yml"),
+            "/home/truares/文档/maniskill-tidyverse/curobo_assets/spheres/franka_tidyverse_mesh.yml",
+        ]
+        yml_path = next((p for p in candidates if os.path.exists(p)), None)
+        if yml_path is None:
+            return {"ok": False, "error": "franka_tidyverse_mesh.yml not found"}
+
+        with open(yml_path) as f:
+            cfg = yaml.safe_load(f)
+        spheres_by_link = cfg.get("collision_spheres", {})
+        if not spheres_by_link:
+            return {"ok": False, "error": "no collision_spheres in yaml"}
+
+        scene = self.env.unwrapped.scene.sub_scenes[0]
+        yellow = sapien.render.RenderMaterial(base_color=[1.0, 0.85, 0.0, 0.45])
+
+        # Remove any spheres from a previous call so repeated invocations don't
+        # stack actors on top of each other.
+        if self._collision_sphere_viz:
+            for actor, _link, _c in self._collision_sphere_viz:
+                try:
+                    actor.remove_from_scene()
+                except Exception:
+                    try:
+                        scene.remove_actor(actor)
+                    except Exception:
+                        pass
+        self._collision_sphere_viz = []
+
+        # cuRobo's franka_tidyverse_mesh.yml uses link names from cuRobo's URDF
+        # (franka_panda_tidyverse.urdf). Some of those names don't exist in sim's
+        # tidyverse.urdf — map them to the closest sim equivalent:
+        #   panda_hand      → robotiq_arg2f_base_link (sim's gripper palm; same position
+        #                     as panda_link8, but no 45° Z rotation — see LINK_LOCAL_ROT)
+        #   panda_leftfinger  → left_inner_finger_pad  (Robotiq fingertip, approximate)
+        #   panda_rightfinger → right_inner_finger_pad (Robotiq fingertip, approximate)
+        #   base_link_z     → base_link (mobile base body; same pose semantics)
+        LINK_NAME_ALIASES = {
+            "panda_hand": "robotiq_arg2f_base_link",
+            "panda_leftfinger": "left_inner_finger_pad",
+            "panda_rightfinger": "right_inner_finger_pad",
+            "base_link_z": "base_link",
+        }
+        # cuRobo's panda_hand is attached to panda_link8 with rpy="0 0 -0.785398" (Rz -π/4),
+        # but sim's robotiq_arg2f_base_link = panda_link8 frame (no rotation). To put
+        # panda_hand-frame sphere centers into robotiq_arg2f_base_link frame we apply Rz(-π/4).
+        _c = 0.7071067811865476
+        LINK_LOCAL_ROT = {
+            "panda_hand": np.array([[ _c,  _c, 0.0],
+                                    [-_c,  _c, 0.0],
+                                    [0.0, 0.0, 1.0]], dtype=np.float64),
+        }
+
+        links_map = self.robot.links_map
+        total = 0
+        skipped_links = []
+        for link_name, spheres in spheres_by_link.items():
+            sim_link_name = LINK_NAME_ALIASES.get(link_name, link_name)
+            if sim_link_name not in links_map:
+                skipped_links.append(f"{link_name}→{sim_link_name}")
+                continue
+            link = links_map[sim_link_name]
+            # Get link world pose (for env 0)
+            link_pos = link.pose.p[_env_idx].cpu().numpy()  # [x, y, z]
+            link_quat = link.pose.q[_env_idx].cpu().numpy()  # wxyz
+            # Build rotation matrix from quat
+            qw, qx, qy, qz = link_quat
+            R = np.array([
+                [1 - 2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+                [2*(qx*qy+qz*qw), 1 - 2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1 - 2*(qx*qx+qy*qy)],
+            ], dtype=np.float64)
+
+            local_rot = LINK_LOCAL_ROT.get(link_name)
+
+            for i, sph in enumerate(spheres):
+                center_local = np.array(sph["center"], dtype=np.float64)
+                radius = float(sph["radius"])
+                if local_rot is not None:
+                    center_local = local_rot @ center_local
+                center_world = link_pos + R @ center_local
+
+                b = sapien.ActorBuilder()
+                b.set_scene(scene)
+                b.add_sphere_visual(radius=radius, material=yellow)
+                b.set_name(f"cusphere_{link_name}_{i}")
+                b.set_initial_pose(sapien.Pose(p=center_world.tolist()))
+                actor = b.build_kinematic()
+                self._collision_sphere_viz.append((actor, link, center_local))
+                total += 1
+
+        return {"ok": True, "spheres_drawn": total,
+                "skipped_links": skipped_links,
+                "links_rendered": [k for k in spheres_by_link if k not in skipped_links]}
+
+    def _cmd_object_mask(self, camera_name="base_camera", object_name=None, _env_idx=0):
+        """Return a binary PNG mask for a specific object as seen by a specific camera.
+
+        Uses sim ground-truth segmentation — no perception/ML involved.
+        Intended as a sim-mode replacement for GroundedSAM.
+
+        Args:
+            camera_name: camera UID ("wrist_camera" or "base_camera")
+            object_name: object name to segment (e.g., "yogurt", "obj_0")
+
+        Returns:
+            dict with:
+              mask_png_b64: base64-encoded PNG of the binary mask (255=obj, 0=bg)
+              mask_pixels:  number of pixels in mask
+              seg_id:       the seg ID used (int)
+              found:        True if object was found
+        """
+        import base64
+        import cv2
+
+        if object_name is None:
+            return {"found": False, "error": "object_name required"}
+
+        # Use the SAME perception logic as _cmd_perceive — ensures name resolution matches.
+        # This reuses perceive_objects which already maps seg_id → actor → obj_name exactly
+        # the way sensors.find_objects() reports.
+        from maniskill_tidyverse.perception import perceive_objects
+        from mani_skill.utils import common
+
+        # Fresh observation
+        action_batch = np.stack([self._actions[i].copy() for i in range(self.num_envs)])
+        action_tensor = torch.tensor(action_batch, dtype=torch.float32)
+        obs, _, _, _, _ = self.env.step(action_tensor)
+
+        sensor_data = obs.get("sensor_data", {})
+        if camera_name not in sensor_data:
+            return {"found": False,
+                    "error": f"camera {camera_name!r} not in sensor_data (available: {list(sensor_data.keys())})"}
+        if "segmentation" not in sensor_data[camera_name]:
+            return {"found": False,
+                    "error": "segmentation not in obs — restart server with --obs-mode rgb+depth+segmentation"}
+
+        seg = common.to_numpy(sensor_data[camera_name]["segmentation"][0])[..., 0]  # [H, W]
+
+        # perceive_objects handles name resolution identically to /perceive
+        perceptions = perceive_objects(
+            obs, self.env.unwrapped, camera_name=camera_name,
+            min_pixels=10, max_depth_mm=5000,
+            target_names=None, skip_filter=False,  # don't filter — we want to find yogurt too
+        )
+
+        # Match by name (exact, then substring)
+        matched = None
+        for p in perceptions:
+            if p.name == object_name:
+                matched = p; break
+        if matched is None:
+            for p in perceptions:
+                if object_name.lower() in p.name.lower():
+                    matched = p; break
+
+        if matched is None:
+            return {
+                "found": False,
+                "error": f"object {object_name!r} not found in perceptions for {camera_name}",
+                "available_names": [p.name for p in perceptions],
+            }
+
+        matched_id = matched.seg_id
+        mask_bool = (seg == matched_id)
+        mask_pixels = int(mask_bool.sum())
+        # Encode to PNG (binary: 0 or 255)
+        mask_u8 = (mask_bool.astype(np.uint8) * 255)
+        _, png_bytes = cv2.imencode(".png", mask_u8)
+        mask_b64 = base64.b64encode(png_bytes.tobytes()).decode("ascii")
+
+        return {
+            "found": True,
+            "seg_id": matched_id,
+            "mask_pixels": mask_pixels,
+            "mask_png_b64": mask_b64,
+            "width": int(mask_u8.shape[1]),
+            "height": int(mask_u8.shape[0]),
+        }
+
     def _cmd_evaluate(self, _env_idx=0):
         """Check task success via the env's _check_success() or evaluate()."""
         env = self.env.unwrapped
@@ -1390,6 +1585,12 @@ class ManiskillServer:
     _OBB_CENTER_OFFSET = (-0.198, 0.0)    # local-frame center offset
     _obb_viz = None
 
+    # Kinematic yellow spheres mirroring cuRobo's robot collision model.
+    # Populated by _cmd_draw_collision_spheres; updated each step by
+    # _update_collision_spheres_viz so the spheres follow the articulation.
+    # Each entry: (actor, sim_link, center_local_corrected[np.ndarray(3)]).
+    _collision_sphere_viz = None
+
     def _create_obb_viz(self):
         """Create a transparent red box that follows the base, showing the
         OBB footprint cuRobo uses for collision validation."""
@@ -1459,6 +1660,36 @@ class ManiskillServer:
                 p=[float(center_world[0]), float(center_world[1]), 0.05],
                 q=[cy, 0.0, 0.0, sy],
             ))
+        except Exception:
+            pass
+
+    def _update_collision_spheres_viz(self, _env_idx=0):
+        """Re-pose every cuRobo collision sphere from its link's current world pose.
+        Called each physics step so the spheres track the articulation."""
+        if not self._collision_sphere_viz:
+            return
+        try:
+            import sapien
+            # Cache per-link (pos, R) so we only read pose once per link instead of per sphere
+            link_cache = {}
+            for actor, link, center_local in self._collision_sphere_viz:
+                key = id(link)
+                cached = link_cache.get(key)
+                if cached is None:
+                    pos = link.pose.p[_env_idx].cpu().numpy()
+                    quat = link.pose.q[_env_idx].cpu().numpy()  # wxyz
+                    qw, qx, qy, qz = quat
+                    R = np.array([
+                        [1 - 2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+                        [2*(qx*qy+qz*qw), 1 - 2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                        [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1 - 2*(qx*qx+qy*qy)],
+                    ], dtype=np.float64)
+                    link_cache[key] = (pos, R)
+                    pos, R = link_cache[key]
+                else:
+                    pos, R = cached
+                center_world = pos + R @ center_local
+                actor.set_pose(sapien.Pose(p=center_world.tolist()))
         except Exception:
             pass
 
@@ -1618,6 +1849,27 @@ class ManiskillServer:
                     except Exception as e:
                         body_out = _json.dumps({"error": str(e)}).encode()
                         self.send_response(500)
+                elif self.path == "/draw_collision_spheres":
+                    try:
+                        result = server_ref.submit_command("draw_collision_spheres", env_idx=eidx)
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
+                elif self.path == "/object_mask":
+                    try:
+                        result = server_ref.submit_command(
+                            "object_mask",
+                            camera_name=data.get("camera_name", "base_camera"),
+                            object_name=data.get("object_name"),
+                            env_idx=eidx,
+                        )
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
                 else:
                     body_out = b'{"error": "not found"}'
                     self.send_response(404)
@@ -1664,6 +1916,7 @@ class ManiskillServer:
 
                 # Update OBB viz before render
                 self._update_obb_viz()
+                self._update_collision_spheres_viz()
 
                 # 3. Render if GUI
                 if self.has_renderer:
