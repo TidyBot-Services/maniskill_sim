@@ -1355,6 +1355,34 @@ class ManiskillServer:
                 "skipped_links": skipped_links,
                 "links_rendered": [k for k in spheres_by_link if k not in skipped_links]}
 
+    def _cmd_debug_cuboids(self, _env_idx=0):
+        """Return cuRobo's current fixture_cuboids list (each with name + world center +
+        half_size) for diagnostic inspection. Helps verify whether a specific fixture
+        (e.g. a cabinet) is actually in cuRobo's collision world and at what position."""
+        if self._curobo is None:
+            return {"ok": False, "error": "cuRobo planner not initialized"}
+        local_cuboids = getattr(self._curobo, "_world_cuboids", None) or []
+        base_link = self.robot.links_map.get("base_link")
+        base_pos = base_link.pose.p[_env_idx].cpu().numpy() if base_link is not None else None
+        base_quat = base_link.pose.q[_env_idx].cpu().numpy() if base_link is not None else None
+        items = []
+        for c in local_cuboids:
+            items.append({
+                "name": c.get("name"),
+                "center_local": list(c.get("center", [])),
+                "half_size": list(c.get("half_size", [])),
+                "quat_wxyz": list(c.get("quat_wxyz", [1.0, 0.0, 0.0, 0.0])),
+            })
+        return {
+            "ok": True,
+            "count": len(items),
+            "base_pose_world": {
+                "pos": base_pos.tolist() if base_pos is not None else None,
+                "quat_wxyz": base_quat.tolist() if base_quat is not None else None,
+            },
+            "cuboids": items,
+        }
+
     def _cmd_object_mask(self, camera_name="base_camera", object_name=None, _env_idx=0):
         """Return a binary PNG mask for a specific object as seen by a specific camera.
 
@@ -1730,6 +1758,14 @@ class ManiskillServer:
                     except Exception as e:
                         body = _json.dumps({"error": str(e)}).encode()
                         self.send_response(500)
+                elif self.path == "/debug/fixture_cuboids":
+                    try:
+                        result = server_ref.submit_command("debug_cuboids", env_idx=eidx)
+                        body = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body = _json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
                 elif self.path == "/task/info":
                     info = {"task": server_ref.task, "env_idx": eidx}
                     # Include task language prompt if available
@@ -1926,16 +1962,15 @@ class ManiskillServer:
                 for i in range(self.num_envs):
                     self._update_state(obs, env_idx=i)
 
-                # 5. Handle episode end (only on task success, not truncation)
-                if terminated.any():
-                    obs, info = self.env.reset()
-                    for i in range(self.num_envs):
-                        qpos = self.robot.get_qpos()[i].cpu().numpy()
-                        with self._action_locks[i]:
-                            self._actions[i][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
-                            self._actions[i][ACTION_GRIPPER_IDX] = GRIPPER_OPEN
-                            self._actions[i][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
-                        self._update_state(obs, env_idx=i)
+                # 5. Intentionally do NOT auto-reset on terminated. Dev agents
+                # call GET /task/success to verify — auto-reset teleports the
+                # object back to spawn on the same frame success fires, so the
+                # verify call reads False even though the placement was correct
+                # (see project_sim_autoreset_blocker.md). Reset must be explicit
+                # via POST /reset from the caller.
+                # if terminated.any():
+                #     obs, info = self.env.reset()
+                #     ...
 
                 # 6. Rate limit
                 time.sleep(step_interval)
