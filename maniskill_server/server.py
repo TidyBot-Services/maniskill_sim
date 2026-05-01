@@ -669,9 +669,20 @@ class ManiskillServer:
         # Initialize cuRobo for whole_body collision-aware planning.
         # Reuses the cuboid list cached during mplib setup — re-querying SAPIEN
         # would perturb mplib's planning state and degrade plan quality.
+        #
+        # Prefer the standalone curobo_service if CUROBO_SERVICE_URL is set —
+        # avoids per-sim-restart 30s warmup and saves GPU memory when multi-target.
         try:
-            from maniskill_tidyverse.curobo_planner import CuroboPlanner
-            self._curobo = CuroboPlanner()
+            curobo_url = os.environ.get("CUROBO_SERVICE_URL", "").strip()
+            if curobo_url:
+                from .curobo_client import CuroboHttpClient
+                env_id = os.environ.get("CUROBO_SERVICE_ENV", f"sim-{os.getpid()}")
+                self._curobo = CuroboHttpClient(service_url=curobo_url, env_id=env_id)
+                print(f"[curobo] Using remote service {curobo_url} (env_id={env_id})")
+            else:
+                from maniskill_tidyverse.curobo_planner import CuroboPlanner
+                self._curobo = CuroboPlanner()
+                print("[curobo] Using in-process planner (set CUROBO_SERVICE_URL to switch)")
             self._curobo.warmup()
 
             if self._fixture_cuboids:
