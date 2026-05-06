@@ -867,53 +867,20 @@ class ManiskillServer:
             "waypoint_count": padded.shape[0],
         }
 
-    def _plan_with_mplib(self, target_p, target_q, qpos, mask):
-        """Fallback planning with mplib."""
-        from mplib import Pose as MPPose
-        from maniskill_tidyverse.planning_utils import sync_planner
-
-        if mask == "arm_only":
-            m = np.array([True] * 3 + [False] * 7 + [True] * 6)
-        else:
-            m = np.array([False] * 3 + [False] * 7 + [True] * 6)
-
-        sync_planner(self._planner)
-        goal = MPPose(p=target_p, q=target_q)
-
-        import time as _time
-        t0 = _time.time()
-        try:
-            result = self._planner.plan_pose(goal, qpos, mask=m, planning_time=10.0)
-        except Exception as e:
-            dt = _time.time() - t0
-            print(f"[plan] mplib ERROR ({dt:.2f}s): {e}")
-            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
-        dt = _time.time() - t0
-
-        if result['status'] != 'Success':
-            print(f"[plan] mplib FAILED ({dt:.2f}s): {result['status']}")
-            return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
-
-        traj = result['position']
-        padded = self._pad_trajectory(traj, qpos)
-        base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
-        print(f"[plan] mplib OK ({dt:.2f}s): {traj.shape[0]} waypoints, "
-              f"base_travel={base_travel:.3f}m, "
-              f"base_end=({traj[-1,0]:.3f},{traj[-1,1]:.3f},{traj[-1,2]:.3f})")
-        return {
-            "status": "success",
-            "trajectory": padded.tolist(),
-            "waypoint_count": padded.shape[0],
-        }
-
     def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
         """Plan a collision-free trajectory to a target EE pose.
 
-        Routing:
-          - cuRobo first (handles whole_body and arm_only via lock_base;
-            the arm_only path uses a second MotionGen with base joints locked)
-          - mplib fallback on cuRobo failure, with OBB base-path validation
-            against RoboCasa fixtures (mplib doesn't know about them)
+        Routing (whole_body):
+          1. cuRobo whole_body — fast path. If its base path clears all
+             fixture cuboids, return as-is.
+          2. Otherwise SPLIT:
+               a. Use cuRobo's chosen final base pose as the goal.
+               b. Plan base separately via base_planner_service (A* on
+                  (x,y,θ) lattice, SAT collision against fixtures).
+               c. Plan arm via cuRobo arm_only with the base locked at goal.
+               d. Concatenate: phase 1 (base moves, arm stays at start),
+                  phase 2 (arm moves, base stays at goal).
+          arm_only mask routes directly to cuRobo (base never moves).
 
         Args:
             target_pose: [x, y, z] target EE position in world frame
@@ -936,47 +903,93 @@ class ManiskillServer:
               f"quat=({target_q[0]:.2f},{target_q[1]:.2f},{target_q[2]:.2f},{target_q[3]:.2f}) "
               f"mask={mask} base=({qpos[0]:.3f},{qpos[1]:.3f},{qpos[2]:.3f})")
 
-        # Try cuRobo first (handles both whole_body and arm_only).
-        curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
-        fallback_reason = None
-        if curobo_result is None:
-            fallback_reason = "cuRobo unavailable/failed"
-        elif curobo_result.get("status") != "success":
-            fallback_reason = f"cuRobo status={curobo_result.get('status')}"
-        else:
-            # cuRobo only checks arm+gripper against the world, not the mobile
-            # base — always validate the base path before accepting.
-            coll, idx, fname = self._validate_base_trajectory(
-                curobo_result["trajectory"], target_p)
-            if coll:
-                fallback_reason = (
-                    f"cuRobo base path hits {fname} at wp {idx} "
-                    f"(arm-only cuRobo collision check; base needs mplib+validator)"
-                )
-            else:
-                return curobo_result
+        # arm_only: base never moves — go straight to cuRobo.
+        if mask == "arm_only":
+            curobo_result = self._plan_with_curobo(target_p, target_q, qpos, mask)
+            if curobo_result is None or curobo_result.get("status") != "success":
+                status = (curobo_result.get("status") if curobo_result
+                          else "cuRobo unavailable")
+                return {"status": status, "trajectory": [], "waypoint_count": 0}
+            return curobo_result
 
-        # Fall back to mplib.
-        print(f"[plan] {fallback_reason}, falling back to mplib")
-        result = self._plan_with_mplib(target_p, target_q, qpos, mask)
-        if result.get("status") != "success":
-            return result
+        # whole_body: try cuRobo first; if its base path is clean, fast-return.
+        curobo_full = self._plan_with_curobo(target_p, target_q, qpos, mask="whole_body")
+        if curobo_full is None or curobo_full.get("status") != "success":
+            status = (curobo_full.get("status") if curobo_full
+                      else "cuRobo unavailable")
+            print(f"[plan] cuRobo failed: {status}")
+            return {"status": status, "trajectory": [], "waypoint_count": 0}
 
-        # Validate mplib's base path too. Both cuRobo and mplib trajectories
-        # live in local (qpos) frame, and cuboids are in local frame after the
-        # world→local cuboid transform in _ensure_planner.
-        coll, idx, fname = self._validate_base_trajectory(result["trajectory"], target_p)
-        if coll:
-            T_wp = len(result["trajectory"])
-            print(f"[plan] mplib base path collides at waypoint {idx}/{T_wp} "
-                  f"with {fname} — no usable plan")
+        coll, idx, fname = self._validate_base_trajectory(
+            curobo_full["trajectory"], target_p)
+        if not coll:
+            print(f"[plan] cuRobo whole_body OK (base path clear)")
+            return curobo_full
+
+        # Base path collides — split into A* base + cuRobo arm_only.
+        cu_goal = list(curobo_full["trajectory"][-1][:3])
+        print(f"[plan] cuRobo base path hits {fname}@wp{idx} → SPLIT "
+              f"(cuRobo_base_goal={cu_goal[0]:.3f},{cu_goal[1]:.3f},{cu_goal[2]:.3f})")
+
+        # cuRobo doesn't check base-vs-world collision, so its chosen base goal
+        # may itself be inside a fixture. Try cuRobo's goal first, then perturb
+        # by ±0.1m in 8 compass directions until A* accepts one.
+        base_result = self._cmd_plan_base(cu_goal, _env_idx=_env_idx)
+        base_goal = cu_goal
+        if base_result.get("status") == "goal_in_collision":
+            print(f"[plan] split: cuRobo goal in collision; searching perturbations")
+            from itertools import product
+            offsets = [(dx, dy) for dx, dy in product([-0.1, 0.0, 0.1], repeat=2)
+                       if not (dx == 0.0 and dy == 0.0)]
+            # sort by distance so we try closest first
+            offsets.sort(key=lambda o: o[0]**2 + o[1]**2)
+            for dx, dy in offsets:
+                pert = [cu_goal[0] + dx, cu_goal[1] + dy, cu_goal[2]]
+                pr = self._cmd_plan_base(pert, _env_idx=_env_idx)
+                if pr.get("status") == "success":
+                    print(f"[plan] split: perturbation (+{dx:.1f},+{dy:.1f}) accepted "
+                          f"({pr['waypoint_count']} wp)")
+                    base_result, base_goal = pr, pert
+                    break
+        if base_result.get("status") != "success":
+            print(f"[plan] split: base A* failed → {base_result.get('status')}")
             return {
-                "status": f"base_collision: {fname} at waypoint {idx}",
-                "trajectory": [],
-                "waypoint_count": 0,
+                "status": f"base_split_{base_result.get('status')}",
+                "trajectory": [], "waypoint_count": 0,
             }
-        print(f"[plan] mplib base path validated ({len(result['trajectory'])} waypoints clear)")
-        return result
+
+        # Plan arm with synthetic qpos (base teleported to goal).
+        synthetic_qpos = qpos.copy()
+        synthetic_qpos[0] = base_goal[0]
+        synthetic_qpos[1] = base_goal[1]
+        synthetic_qpos[2] = base_goal[2]
+        arm_result = self._plan_with_curobo(target_p, target_q, synthetic_qpos,
+                                             mask="arm_only")
+        if arm_result is None or arm_result.get("status") != "success":
+            status = (arm_result.get("status") if arm_result
+                      else "cuRobo unavailable")
+            print(f"[plan] split: arm_only at goal failed → {status}")
+            return {
+                "status": f"arm_split_{status}",
+                "trajectory": [], "waypoint_count": 0,
+            }
+
+        # Concatenate: phase 1 (base moves, arm at start) + phase 2 (arm at goal base).
+        full_traj = []
+        for wp in base_result["trajectory"]:
+            full = qpos.copy()
+            full[0], full[1], full[2] = wp[0], wp[1], wp[2]
+            full_traj.append(full.tolist())
+        for wp in arm_result["trajectory"]:
+            full_traj.append(wp)
+
+        print(f"[plan] split OK: {len(base_result['trajectory'])} base wp + "
+              f"{len(arm_result['trajectory'])} arm wp = {len(full_traj)} total")
+        return {
+            "status": "success",
+            "trajectory": full_traj,
+            "waypoint_count": len(full_traj),
+        }
 
     def _plan_joint_with_curobo(self, target_qpos, qpos):
         """Try joint-space planning with cuRobo. Returns result dict or None.
@@ -1004,9 +1017,7 @@ class ManiskillServer:
         }
 
     def _cmd_plan_joint(self, target_qpos, _env_idx=0):
-        """Plan a collision-free trajectory to target joint positions.
-
-        Routing: cuRobo first, mplib fallback.
+        """Plan a collision-free trajectory to target joint positions via cuRobo.
 
         Args:
             target_qpos: full qpos (16 values: base3 + arm7 + gripper6)
@@ -1014,37 +1025,16 @@ class ManiskillServer:
         Returns:
             dict with keys: status, trajectory, waypoint_count
         """
-        from maniskill_tidyverse.planning_utils import sync_planner
-
         self._ensure_planner()
         qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
         target = np.array(target_qpos, dtype=float)
 
-        # cuRobo first
         curobo_result = self._plan_joint_with_curobo(target, qpos)
         if curobo_result is not None and curobo_result.get("status") == "success":
             return curobo_result
-
-        # Fallback to mplib
-        print("[plan_joint] cuRobo unavailable/failed, falling back to mplib")
-        planner = self._planner
-        sync_planner(planner)
-
-        try:
-            result = planner.plan_qpos([target], qpos, planning_time=10.0)
-        except Exception as e:
-            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
-
-        if result['status'] != 'Success':
-            return {"status": result['status'], "trajectory": [], "waypoint_count": 0}
-
-        traj = result['position']
-        padded = self._pad_trajectory(traj, qpos)
-        return {
-            "status": "success",
-            "trajectory": padded.tolist(),
-            "waypoint_count": padded.shape[0],
-        }
+        status = (curobo_result.get("status") if curobo_result
+                  else "cuRobo unavailable")
+        return {"status": status, "trajectory": [], "waypoint_count": 0}
 
     def _ik_with_curobo(self, target_p, target_q, qpos, mask):
         """Try IK with cuRobo. Returns result dict or None.
@@ -1072,16 +1062,11 @@ class ManiskillServer:
         return {"status": "success", "qpos": q_sol.tolist()}
 
     def _cmd_plan_ik(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
-        """Solve IK for a target EE pose without planning a path.
-
-        Routing: cuRobo first (num_seeds=40, return_closest=True), mplib fallback.
+        """Solve IK for a target EE pose without planning a path (cuRobo).
 
         Returns:
             dict with keys: status, qpos (10 values: base3 + arm7, or empty)
         """
-        from mplib import Pose as MPPose
-        from maniskill_tidyverse.planning_utils import sync_planner
-
         self._ensure_planner()
 
         target_p = np.array(target_pose, dtype=float)
@@ -1092,41 +1077,76 @@ class ManiskillServer:
 
         qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
 
-        # cuRobo first
         curobo_result = self._ik_with_curobo(target_p, target_q, qpos, mask)
         if curobo_result is not None and curobo_result.get("status") == "success":
             print(f"[ik] cuRobo OK target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
             return curobo_result
+        print(f"[ik] cuRobo failed target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
+        return {"status": "no_solution", "qpos": []}
 
-        # Fallback to mplib
-        print("[ik] cuRobo unavailable/failed, falling back to mplib")
-        planner = self._planner
+    def _cmd_plan_base(self, target_xyθ, _env_idx=0):
+        """Plan a holonomic base path via base_planner_service (A* on grid).
 
-        if mask == "arm_only":
-            m = np.array([True] * 3 + [False] * 7 + [True] * 6)
-        else:
-            m = np.array([False] * 3 + [False] * 7 + [True] * 6)
+        Forwards (start_xyθ, goal_xyθ, cuboids) to http://localhost:6100/plan.
+        Both start and goal are in LOCAL frame (qpos coordinates), matching
+        the cuboid frame stored in self._fixture_cuboids.
 
-        sync_planner(planner)
-        goal = MPPose(p=target_p, q=target_q)
-
+        Returns dict {status, trajectory, waypoint_count}. trajectory is a
+        list of [x, y, theta] tuples in LOCAL frame, ready to execute.
+        """
+        import urllib.request as _ur
+        import urllib.error as _ue
+        import json as _json
         import time as _time
+
+        self._ensure_planner()
+        qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
+        start = [float(qpos[0]), float(qpos[1]), float(qpos[2])]
+        goal = [float(target_xyθ[0]), float(target_xyθ[1]), float(target_xyθ[2])]
+
+        # Use cuRobo's already-transformed LOCAL-frame cuboids (set_collision_world
+        # does world→local transform). Same frame as qpos start/goal.
+        # Falls back to self._fixture_cuboids (WORLD frame) only if cuRobo not init.
+        if self._curobo is not None and getattr(self._curobo, "_world_cuboids", None):
+            cuboids = self._curobo._world_cuboids
+        else:
+            cuboids = getattr(self, "_fixture_cuboids", None) or []
+        cu_payload = [
+            {"name": c.get("name", ""),
+             "center": list(c["center"]),
+             "half_size": list(c["half_size"])}
+            for c in cuboids
+        ]
+
+        body = _json.dumps({
+            "start": start,
+            "goal": goal,
+            "cuboids": cu_payload,
+            "base_half_extents": [0.40, 0.30],
+        }).encode()
+
+        req = _ur.Request("http://localhost:6100/plan",
+                          data=body, headers={"Content-Type": "application/json"})
         t0 = _time.time()
         try:
-            status, solutions = planner.IK(goal, qpos, mask=m, n_init_qpos=40,
-                                           return_closest=True)
-        except Exception as e:
+            resp = _ur.urlopen(req, timeout=30)
+            result = _json.loads(resp.read())
             dt = _time.time() - t0
-            print(f"[ik] ERROR ({dt:.2f}s): {e}")
-            return {"status": f"error: {e}", "qpos": []}
-        dt = _time.time() - t0
-
-        if solutions is None:
-            print(f"[ik] no_solution ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
-            return {"status": "no_solution", "qpos": []}
-
-        print(f"[ik] mplib OK ({dt:.2f}s) target=({target_p[0]:.3f},{target_p[1]:.3f},{target_p[2]:.3f}) mask={mask}")
-        return {"status": "success", "qpos": solutions.tolist()}
+            print(f"[plan_base] start=({start[0]:.2f},{start[1]:.2f},{start[2]:.2f}) "
+                  f"goal=({goal[0]:.2f},{goal[1]:.2f},{goal[2]:.2f}) "
+                  f"status={result.get('status')} wp={result.get('waypoint_count')} "
+                  f"iters={result.get('iters')} svc={result.get('elapsed_ms',0):.0f}ms")
+            return {
+                "status": result.get("status", "error"),
+                "trajectory": result.get("trajectory", []),
+                "waypoint_count": result.get("waypoint_count", 0),
+            }
+        except _ue.URLError as e:
+            print(f"[plan_base] base_planner_service unreachable: {e}")
+            return {"status": f"base_planner_unavailable: {e}",
+                    "trajectory": [], "waypoint_count": 0}
+        except Exception as e:
+            return {"status": f"error: {e}", "trajectory": [], "waypoint_count": 0}
 
     def _cmd_perceive(self, camera_names=None, target_names=None,
                        min_pixels=50, max_depth_mm=5000, _env_idx=0):
@@ -1840,6 +1860,18 @@ class ManiskillServer:
                             target_pose=data.get("target_pose"),
                             target_quat=data.get("target_quat"),
                             mask=data.get("mask", "whole_body"),
+                        )
+                        body_out = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body_out = _json.dumps({"status": f"error: {e}"}).encode()
+                        self.send_response(500)
+                elif self.path == "/plan_base":
+                    try:
+                        result = server_ref.submit_command(
+                            "plan_base",
+                            env_idx=eidx,
+                            target_xyθ=data.get("target"),
                         )
                         body_out = _json.dumps(result).encode()
                         self.send_response(200)
