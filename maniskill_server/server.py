@@ -1560,7 +1560,7 @@ class ManiskillServer:
         import maniskill_tidyverse.tidyverse_agent  # noqa: registers 'tidyverse'
         import mani_skill.envs   # noqa: registers envs
         try:
-            import maniskill_tidyverse.robocasa_tasks  # noqa: registers RoboCasa single-stage tasks
+            import robocasa_tasks  # noqa: registers RoboCasa single-stage tasks
         except ImportError:
             pass
         import gymnasium as gym
