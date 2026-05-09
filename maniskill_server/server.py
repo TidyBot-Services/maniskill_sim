@@ -932,23 +932,28 @@ class ManiskillServer:
               f"(cuRobo_base_goal={cu_goal[0]:.3f},{cu_goal[1]:.3f},{cu_goal[2]:.3f})")
 
         # cuRobo doesn't check base-vs-world collision, so its chosen base goal
-        # may itself be inside a fixture. Try cuRobo's goal first, then perturb
-        # by ±0.1m in 8 compass directions until A* accepts one.
+        # may itself be inside a fixture. Try cuRobo's goal first, then sweep
+        # 3 concentric shells (0.15 / 0.30 / 0.45 m) × 16 directions each.
+        # ±0.1m × 8 was too small — kitchen fixtures (sink/counter) are >0.2m
+        # so the entire ±0.1m neighborhood stays in collision.
         base_result = self._cmd_plan_base(cu_goal, _env_idx=_env_idx)
         base_goal = cu_goal
         if base_result.get("status") == "goal_in_collision":
             print(f"[plan] split: cuRobo goal in collision; searching perturbations")
-            from itertools import product
-            offsets = [(dx, dy) for dx, dy in product([-0.1, 0.0, 0.1], repeat=2)
-                       if not (dx == 0.0 and dy == 0.0)]
-            # sort by distance so we try closest first
+            import math
+            offsets = []
+            for radius in (0.15, 0.30, 0.45):
+                for i in range(16):
+                    a = 2 * math.pi * i / 16
+                    offsets.append((radius * math.cos(a), radius * math.sin(a)))
+            # sort by distance so we try closest shell first
             offsets.sort(key=lambda o: o[0]**2 + o[1]**2)
             for dx, dy in offsets:
                 pert = [cu_goal[0] + dx, cu_goal[1] + dy, cu_goal[2]]
                 pr = self._cmd_plan_base(pert, _env_idx=_env_idx)
                 if pr.get("status") == "success":
-                    print(f"[plan] split: perturbation (+{dx:.1f},+{dy:.1f}) accepted "
-                          f"({pr['waypoint_count']} wp)")
+                    print(f"[plan] split: perturbation (+{dx:+.2f},+{dy:+.2f}) accepted "
+                          f"({pr['waypoint_count']} wp, r={math.hypot(dx,dy):.2f}m)")
                     base_result, base_goal = pr, pert
                     break
         if base_result.get("status") != "success":
