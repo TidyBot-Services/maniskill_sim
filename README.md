@@ -55,3 +55,26 @@ python tests/test_sim_e2e.py --keep-alive   # keep servers running after test
 ```
 
 Tests: read robot state, move arm joint, move base forward, verify camera recordings.
+
+## AttentionBench variation attestation
+
+The task HTTP API keeps the existing `POST /reset {"seed": N}` behavior for
+normal callers. Development-only variation discovery can send
+`{"seed": N, "discover_variation": true}`. This reconfigures the scene and
+returns `applied_variation` with `scene_id` and `object_set_id`, derived from
+realized fixture geometry and task-object names/positions. The scene ID attests
+layout geometry, not texture/style; visual-style variation requires a separate
+attestation source before it can enter a frozen validation matrix.
+The IDs are not hashes of the requested seed.
+
+Validation can send `{"seed": N, "variation": {"scene_id": "...",
+"object_set_id": "..."}}`. The server reconfigures, computes the realized
+IDs, and rejects a mismatch. Tasks without usable scene metadata or object
+configuration fail closed. Camera-view attestation comes from `/perceive`'s
+`cameras` field; same-task instruction variants are selected and recorded by
+the AttentionHarness rather than changing the native success evaluator.
+
+Discover IDs on the same simulator build and task configuration used for the
+paired runs. A deployment must check that repeated resets for the same seed
+produce the same IDs before freezing cases. The pure identity tests do not
+substitute for a live RoboCasa task acceptance run.

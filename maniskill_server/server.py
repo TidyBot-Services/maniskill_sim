@@ -439,13 +439,16 @@ class ManiskillServer:
         self.set_gripper_action(GRIPPER_OPEN, env_idx=_env_idx)
         return True
 
-    def _cmd_reset(self, seed=None, _env_idx=0):
+    def _cmd_reset(self, seed=None, reconfigure=False, _env_idx=0):
         """Reset one env (GPU mode) or all envs (CPU mode)."""
         if self.num_envs > 1:
             # Per-env reset: only reset the requested env
+            options = {"env_idx": torch.tensor([_env_idx], device=self._device)}
+            if reconfigure:
+                options["reconfigure"] = True
             obs, info = self.env.reset(
                 seed=seed,
-                options={"env_idx": torch.tensor([_env_idx], device=self._device)},
+                options=options,
             )
             qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
             with self._action_locks[_env_idx]:
@@ -454,7 +457,9 @@ class ManiskillServer:
                 self._actions[_env_idx][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
             self._update_state(obs, env_idx=_env_idx)
         else:
-            obs, info = self.env.reset(seed=seed)
+            obs, info = self.env.reset(
+                seed=seed, options={"reconfigure": True} if reconfigure else None,
+            )
             qpos = self.robot.get_qpos()[0].cpu().numpy()
             with self._action_locks[0]:
                 self._actions[0][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
@@ -602,6 +607,26 @@ class ManiskillServer:
                         "z": float(pos[2]),
                     })
         return {"objects": result, "count": len(result)}
+
+    def _cmd_variation_identity(self, _env_idx=0):
+        """Evaluator-side identity of the realized scene and object layout."""
+        from .variation_identity import variation_identity
+
+        env = self.env.unwrapped
+        if not hasattr(env, "get_ep_meta"):
+            raise ValueError("task cannot attest episode scene metadata")
+        ep_meta = env.get_ep_meta()
+        if not isinstance(ep_meta, dict):
+            raise ValueError("task episode metadata is not a mapping")
+        scene_idx = getattr(env, "_scene_idx_to_be_loaded", _env_idx)
+        scene_data = getattr(getattr(env, "scene_builder", None), "scene_data", [])
+        fixture_configs = (
+            scene_data[scene_idx].get("fixture_cfgs")
+            if isinstance(scene_idx, int) and 0 <= scene_idx < len(scene_data)
+            else None
+        )
+        objects = self._cmd_ground_truth_objects(_env_idx=_env_idx)["objects"]
+        return variation_identity(ep_meta, objects, fixture_configs=fixture_configs)
 
     # -- Motion planning (lazy-init) -----------------------------------------
 
@@ -1181,12 +1206,6 @@ class ManiskillServer:
         if not sensor_data:
             return {"objects": [], "count": 0, "error": "no sensor data in obs"}
 
-        first_cam = next(iter(sensor_data))
-        if "segmentation" not in sensor_data[first_cam]:
-            return {"objects": [], "count": 0,
-                    "error": "segmentation not in obs — restart server with "
-                             "--obs-mode rgb+depth+segmentation"}
-
         # Get fixtures for context classification
         fixtures = {}
         try:
@@ -1207,17 +1226,18 @@ class ManiskillServer:
         except Exception:
             pass
 
-        # Run perception on requested cameras
-        if camera_names is None:
-            camera_names = list(sensor_data.keys())
+        # Do not echo a requested camera that was silently skipped.
+        from .variation_identity import selected_cameras
+        try:
+            camera_names = selected_cameras(sensor_data, camera_names)
+        except ValueError as exc:
+            return {"objects": [], "count": 0, "error": str(exc)}
 
         all_objects = []
         seen_names = set()
         target_set = set(target_names) if target_names else None
 
         for cam_name in camera_names:
-            if cam_name not in sensor_data:
-                continue
             perceptions = perceive_objects(
                 obs, self.env.unwrapped, camera_name=cam_name,
                 min_pixels=min_pixels, max_depth_mm=max_depth_mm,
@@ -1901,8 +1921,25 @@ class ManiskillServer:
                 elif self.path == "/reset":
                     try:
                         seed = data.get("seed")
-                        server_ref.submit_command("reset", env_idx=eidx, seed=seed)
-                        body_out = b'{"status": "ok"}'
+                        requested = data.get("variation")
+                        discovery = data.get("discover_variation") is True
+                        if requested is not None and (
+                            not isinstance(requested, dict)
+                            or set(requested) != {"scene_id", "object_set_id"}
+                            or not all(isinstance(value, str) and value for value in requested.values())
+                        ):
+                            raise ValueError("variation requires scene_id and object_set_id")
+                        server_ref.submit_command(
+                            "reset", env_idx=eidx, seed=seed,
+                            reconfigure=requested is not None or discovery,
+                        )
+                        result = {"status": "ok"}
+                        if requested is not None or discovery:
+                            applied = server_ref.submit_command("variation_identity", env_idx=eidx)
+                            if requested is not None and applied != requested:
+                                raise ValueError("reset did not realize requested scene/object variation")
+                            result["applied_variation"] = applied
+                        body_out = _json.dumps(result).encode()
                         self.send_response(200)
                     except Exception as e:
                         body_out = _json.dumps({"status": f"error: {e}"}).encode()
