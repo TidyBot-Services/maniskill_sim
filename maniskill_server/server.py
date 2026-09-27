@@ -1439,6 +1439,23 @@ class ManiskillServer:
             "cuboids": items,
         }
 
+    def _cmd_debug_robot_links(self, _env_idx=0):
+        """Development-only robot geometry diagnostic; never an agent observation."""
+        names = (
+            "base_link", "panda_link0", "eef", "robotiq_arg2f_base_link",
+            "left_inner_finger_pad", "right_inner_finger_pad",
+        )
+        links = {}
+        for name in names:
+            link = self.robot.links_map.get(name)
+            if link is None:
+                continue
+            links[name] = {
+                "position_world": link.pose.p[_env_idx].cpu().numpy().tolist(),
+                "quat_wxyz": link.pose.q[_env_idx].cpu().numpy().tolist(),
+            }
+        return {"links": links}
+
     def _cmd_object_mask(self, camera_name="base_camera", object_name=None, _env_idx=0):
         """Return a binary PNG mask for a specific object as seen by a specific camera.
 
@@ -1817,6 +1834,14 @@ class ManiskillServer:
                 elif self.path == "/debug/fixture_cuboids":
                     try:
                         result = server_ref.submit_command("debug_cuboids", env_idx=eidx)
+                        body = _json.dumps(result).encode()
+                        self.send_response(200)
+                    except Exception as e:
+                        body = _json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
+                elif self.path == "/debug/robot_links":
+                    try:
+                        result = server_ref.submit_command("debug_robot_links", env_idx=eidx)
                         body = _json.dumps(result).encode()
                         self.send_response(200)
                     except Exception as e:
