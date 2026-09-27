@@ -450,6 +450,10 @@ class ManiskillServer:
                 seed=seed,
                 options=options,
             )
+            if reconfigure:
+                # Reconfiguration creates a new articulation. Bridges read
+                # self.robot, so keep it bound to the active environment.
+                self.robot = self.env.unwrapped.agent.robot
             qpos = self.robot.get_qpos()[_env_idx].cpu().numpy()
             with self._action_locks[_env_idx]:
                 self._actions[_env_idx][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
@@ -460,6 +464,8 @@ class ManiskillServer:
             obs, info = self.env.reset(
                 seed=seed, options={"reconfigure": True} if reconfigure else None,
             )
+            if reconfigure:
+                self.robot = self.env.unwrapped.agent.robot
             qpos = self.robot.get_qpos()[0].cpu().numpy()
             with self._action_locks[0]:
                 self._actions[0][ACTION_ARM_SLICE] = qpos[QPOS_ARM_SLICE]
