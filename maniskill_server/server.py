@@ -14,6 +14,7 @@ Architecture (mirrors MuJoCo SimServer):
         - Enqueue blocking commands via submit_command()
 """
 
+import json
 import os
 import sys
 import threading
@@ -135,6 +136,8 @@ class ManiskillServer:
         # Latest observation (for camera bridge)
         self._latest_obs = None
         self._obs_lock = threading.Lock()
+        self._contact_diag_step = 0
+        self._contact_diag_robot_links = None
 
     # -- State access (thread-safe) ----------------------------------------
 
@@ -243,6 +246,49 @@ class ManiskillServer:
         """Set base position targets (x, y, yaw)."""
         with self._action_locks[env_idx]:
             self._actions[env_idx][ACTION_BASE_SLICE] = np.asarray(base_targets, dtype=np.float32)
+
+    def _log_contact_diagnostics(self):
+        """Opt-in, read-only physical contact samples for isolated probes."""
+        if os.environ.get("TIDYBOT_CONTACT_DIAGNOSTICS") != "1":
+            return
+        self._contact_diag_step += 1
+        if self._contact_diag_step % 5:
+            return
+        try:
+            if self._contact_diag_robot_links is None:
+                self._contact_diag_robot_links = {
+                    link.get_name() for link in self.robot.get_links()
+                }
+            contacts = self.env.unwrapped.scene.get_contacts()
+            rows = []
+            for contact in contacts:
+                if not contact.points:
+                    continue
+                bodies = contact.bodies
+                names = [body.entity.name if body.entity else str(body)
+                         for body in bodies]
+                if (names[0] in self._contact_diag_robot_links) == (
+                    names[1] in self._contact_diag_robot_links
+                ):
+                    continue
+                impulse = np.sum([point.impulse for point in contact.points], axis=0)
+                magnitude = float(np.linalg.norm(impulse))
+                if magnitude < 0.01:
+                    continue
+                robot_part = names[0] if names[0] in self._contact_diag_robot_links else names[1]
+                other_part = names[1] if robot_part == names[0] else names[0]
+                rows.append((magnitude, robot_part, other_part))
+            if rows:
+                print("[contact_diag] " + json.dumps({
+                    "step": self._contact_diag_step,
+                    "time": time.time(),
+                    "pairs": [
+                        {"impulse": magnitude, "robot": robot, "other": other}
+                        for magnitude, robot, other in sorted(rows, reverse=True)[:5]
+                    ],
+                }, sort_keys=True), flush=True)
+        except Exception as exc:
+            print(f"[contact_diag] unavailable: {type(exc).__name__}: {exc}", flush=True)
 
     # -- Command queue (blocking) ------------------------------------------
 
@@ -904,7 +950,11 @@ class ManiskillServer:
         traj = self._curobo.plan_pose(current_q, target_p_local, target_q_local,
                                        lock_base=(mask == "arm_only"))
         if traj is None:
-            return None
+            # A loaded planner can reject a particular pose (for example,
+            # IK_FAIL). Keep that distinct from a missing cuRobo instance;
+            # the detailed MotionGen status remains in the simulator log.
+            return {"status": "curobo_no_trajectory", "trajectory": [],
+                    "waypoint_count": 0}
 
         padded = self._pad_trajectory(traj, qpos)
         base_travel = float(np.linalg.norm(traj[-1, :3] - traj[0, :3]))
@@ -916,6 +966,74 @@ class ManiskillServer:
             "trajectory": padded.tolist(),
             "waypoint_count": padded.shape[0],
         }
+
+    def _check_door_trajectory(self, trajectory):
+        """Count FCL arm-path collisions against articulated door links.
+
+        The normal kitchen ACM relaxes all articulated fixtures. This probe
+        temporarily enables robot-door pairs, restores the ACM and planning
+        world in finally, and never changes the SAPIEN simulation state.
+        """
+        pw = self._planner_pw
+        if pw is None:
+            print("[door_guard] no planning world")
+            return None
+        acm = pw.get_allowed_collision_matrix()
+        art_names = pw.get_articulation_names()
+        robot_name = next((n for n in art_names if "tidyverse" in n.lower()), None)
+        if robot_name is None:
+            print(f"[door_guard] no robot articulation in {art_names}")
+            return None
+        robot_model = pw.get_articulation(robot_name)
+        robot_links = robot_model.get_pinocchio_model().get_link_names()
+        door_links = sorted({link for name in art_names if name != robot_name
+                             for link in pw.get_articulation(name)
+                             .get_pinocchio_model().get_link_names()
+                             if "door" in link.lower()})
+        print(f"[door_guard] robot={robot_name} links={len(robot_links)} "
+              f"doors={len(door_links)} waypoints={len(trajectory)}")
+        if not door_links:
+            return 0
+
+        prior = {(robot_link, door_link): acm.get_entry(robot_link, door_link)
+                 for robot_link in robot_links for door_link in door_links}
+        if any(value is not None and value.name == "CONDITIONAL"
+               for value in prior.values()):
+            print("[door_guard] conditional ACM entry; probe unavailable")
+            return None
+        hits = []
+        check_failed = False
+        try:
+            pw.update_from_simulation()
+            for robot_link, door_link in prior:
+                acm.set_entry(robot_link, door_link, False)
+            for index, waypoint in enumerate(trajectory):
+                robot_model.set_qpos(np.asarray(waypoint, dtype=float), full=True)
+                collisions = pw.check_robot_collision()
+                for collision in collisions:
+                    fields = (collision.link_name1, collision.link_name2,
+                              collision.object_name1, collision.object_name2)
+                    if any(door in fields for door in door_links):
+                        hits.append((index, fields))
+                        if len(hits) <= 5:
+                            print(f"[door_guard] hit waypoint={index} pair={fields}")
+            print(f"[door_guard] door_hit_waypoints={len(set(i for i, _ in hits))} "
+                  f"first={hits[0][0] if hits else None}")
+        except Exception as exc:
+            print(f"[door_guard] probe_error={type(exc).__name__}: {exc}")
+            check_failed = True
+        finally:
+            try:
+                for (robot_link, door_link), value in prior.items():
+                    if value is None:
+                        acm.remove_entry(robot_link, door_link)
+                    else:
+                        acm.set_entry(robot_link, door_link, value.name == "ALWAYS")
+                pw.update_from_simulation()
+            except Exception as exc:
+                print(f"[door_guard] restore_error={type(exc).__name__}: {exc}")
+                check_failed = True
+        return None if check_failed else len(set(i for i, _ in hits))
 
     def _cmd_plan(self, target_pose, target_quat=None, mask="whole_body", _env_idx=0):
         """Plan a collision-free trajectory to a target EE pose.
@@ -960,6 +1078,11 @@ class ManiskillServer:
                 status = (curobo_result.get("status") if curobo_result
                           else "cuRobo unavailable")
                 return {"status": status, "trajectory": [], "waypoint_count": 0}
+            door_hits = self._check_door_trajectory(curobo_result["trajectory"])
+            if door_hits is None or door_hits:
+                print(f"[door_guard] arm path rejected: door_hit_waypoints={door_hits}")
+                return {"status": "curobo_no_trajectory", "trajectory": [],
+                        "waypoint_count": 0}
             return curobo_result
 
         # whole_body: try cuRobo first; if its base path is clean, fast-return.
@@ -1221,10 +1344,9 @@ class ManiskillServer:
         """
         from maniskill_tidyverse.perception import perceive_objects, classify_fixture_context
 
-        # Get fresh observation with current state (steps all envs with their current actions)
-        action_batch = np.stack([self._actions[i].copy() for i in range(self.num_envs)])
-        action_tensor = torch.tensor(action_batch, dtype=torch.float32)
-        obs, _, _, _, _ = self.env.step(action_tensor)
+        # Render the current state without replaying the last control targets.
+        # A perception request must not advance physics or the episode clock.
+        obs = self.env.unwrapped.get_obs()
 
         # Check segmentation is available
         sensor_data = obs.get("sensor_data", {})
@@ -1510,10 +1632,8 @@ class ManiskillServer:
         from maniskill_tidyverse.perception import perceive_objects
         from mani_skill.utils import common
 
-        # Fresh observation
-        action_batch = np.stack([self._actions[i].copy() for i in range(self.num_envs)])
-        action_tensor = torch.tensor(action_batch, dtype=torch.float32)
-        obs, _, _, _, _ = self.env.step(action_tensor)
+        # Segmentation uses the same read-only rendering path as /perceive.
+        obs = self.env.unwrapped.get_obs()
 
         sensor_data = obs.get("sensor_data", {})
         if camera_name not in sensor_data:
@@ -2096,6 +2216,7 @@ class ManiskillServer:
                 action_tensor = torch.tensor(action_batch, dtype=torch.float32,
                                              device=self._device)
                 obs, reward, terminated, truncated, info = self.env.step(action_tensor)
+                self._log_contact_diagnostics()
 
                 # Update OBB viz before render
                 self._update_obb_viz()
