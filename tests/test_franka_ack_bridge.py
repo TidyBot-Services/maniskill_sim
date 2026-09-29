@@ -39,3 +39,14 @@ def test_joint_command_rejects_bad_values_and_backend_failure():
     failed = bridge(_Sim(fail=True))._dispatch_cmd(
         {"msg_type": MSG_JOINT_POSITION_CMD, "q": [0.0] * 7})
     assert failed["success"] is False
+
+
+def test_ack_command_works_when_stream_is_dropped(monkeypatch):
+    monkeypatch.setenv("TIDYBOT_DROP_FRANKA_JOINT_STREAM", "1")
+    sim = _Sim()
+    instance = bridge(sim)
+    q = [0.2] * 7
+    instance._handle_stream_msg({"msg_type": MSG_JOINT_POSITION_CMD, "q": q})
+    assert sim.commands == []
+    assert instance._dispatch_cmd({"msg_type": MSG_JOINT_POSITION_CMD, "q": q})["success"] is True
+    assert sim.commands == [(2, q)]

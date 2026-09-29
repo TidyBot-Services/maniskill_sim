@@ -184,6 +184,10 @@ class FrankaBridge:
         msg_type = msg.get("msg_type", -1)
 
         if msg_type == MSG_JOINT_POSITION_CMD:
+            # Engineering fault injection: model a wholly lost PUB channel.
+            # Formal runs leave this flag unset; the REQ ACK path is separate.
+            if os.environ.get("TIDYBOT_DROP_FRANKA_JOINT_STREAM") == "1":
+                return
             q = msg.get("q", [])
             if len(q) == 7:
                 self._server.set_arm_action(env_idx=self._env_idx, targets=q)
