@@ -944,6 +944,27 @@ class ManiskillServer:
         if self._curobo is None:
             return None
 
+        if mask == "arm_only" and self._planner_pw is not None:
+            # The upstream planner can recover START_STATE_IN_COLLISION by
+            # clearing its entire collision world. Such a trajectory is not
+            # collision certified, and a near-sink execution stalled the arm
+            # and pushed the base in the archived seed-116 profile. Reject a
+            # static-fixture start collision before asking that planner.
+            try:
+                self._planner_pw.update_from_simulation()
+                collisions = self._planner_pw.check_robot_collision()
+                fixtures = sorted({name for collision in collisions for name in (
+                    collision.object_name1, collision.object_name2)
+                    if isinstance(name, str) and name.startswith("fixture_box_")})
+            except Exception as exc:
+                print(f"[plan_guard] start collision check failed: {type(exc).__name__}: {exc}")
+                return {"status": "curobo_no_trajectory", "trajectory": [],
+                        "waypoint_count": 0}
+            if fixtures:
+                print(f"[plan_guard] arm start collides with static fixture(s): {fixtures}")
+                return {"status": "curobo_no_trajectory", "trajectory": [],
+                        "waypoint_count": 0}
+
         current_q = self._build_current_q(qpos)
         target_p_local, target_q_local = self._world_pose_to_local(target_p, target_q)
 
