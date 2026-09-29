@@ -45,6 +45,13 @@ def test_reconfigure_rebinds_state_and_action_to_new_robot():
     server = ManiskillServer("RoboCasa-Pn-P-Counter-To-Sink-v0")
     server.env = _Env()
     server.robot = old_robot
+    old_curobo = object()
+    server._planner = object()
+    server._planner_pw = object()
+    server._fixture_box_names = ["stale_fixture"]
+    server._fixture_cuboids = [{"name": "stale_fixture"}]
+    server._base_link_home_T = np.eye(4)
+    server._curobo = old_curobo
     observed = []
     server._update_state = lambda obs, env_idx: observed.append((obs, env_idx, server.robot))
 
@@ -52,3 +59,9 @@ def test_reconfigure_rebinds_state_and_action_to_new_robot():
     assert server.robot is new_robot
     assert server._actions[0][-3] == 2.0
     assert observed == [({}, 0, new_robot)]
+    assert server._planner is None
+    assert server._planner_pw is None
+    assert server._fixture_box_names == []
+    assert server._fixture_cuboids == []
+    assert server._base_link_home_T is None
+    assert server._curobo is old_curobo

@@ -472,6 +472,7 @@ class ManiskillServer:
                 self._actions[0][ACTION_GRIPPER_IDX] = GRIPPER_OPEN
                 self._actions[0][ACTION_BASE_SLICE] = qpos[QPOS_BASE_SLICE]
             self._update_state(obs, env_idx=0)
+        self._invalidate_planner_after_reset()
         return True
 
     def _cmd_teleport(self, obj_name="obj", position=None, _env_idx=0):
@@ -641,6 +642,21 @@ class ManiskillServer:
     _fixture_box_names = []
     _curobo = None  # CuroboPlanner instance
 
+    def _invalidate_planner_after_reset(self):
+        """Discard scene-bound planning state after every environment reset.
+
+        A reconfigured RoboCasa reset can change the articulation root pose and
+        kitchen fixtures. Keeping the startup planner makes world-to-local
+        targets and collision boxes refer to the previous scene. The cuRobo
+        kernels are scene-independent and can be reused; _ensure_planner will
+        load the new collision world before the next query.
+        """
+        self._planner = None
+        self._planner_pw = None
+        self._fixture_box_names = []
+        self._fixture_cuboids = []
+        self._base_link_home_T = None
+
     def _ensure_planner(self):
         """Lazy-init planner on first use (must be called on physics thread).
 
@@ -704,17 +720,20 @@ class ManiskillServer:
         # Prefer the standalone curobo_service if CUROBO_SERVICE_URL is set —
         # avoids per-sim-restart 30s warmup and saves GPU memory when multi-target.
         try:
-            curobo_url = os.environ.get("CUROBO_SERVICE_URL", "").strip()
-            if curobo_url:
-                from .curobo_client import CuroboHttpClient
-                env_id = os.environ.get("CUROBO_SERVICE_ENV", f"sim-{os.getpid()}")
-                self._curobo = CuroboHttpClient(service_url=curobo_url, env_id=env_id)
-                print(f"[curobo] Using remote service {curobo_url} (env_id={env_id})")
+            if self._curobo is None:
+                curobo_url = os.environ.get("CUROBO_SERVICE_URL", "").strip()
+                if curobo_url:
+                    from .curobo_client import CuroboHttpClient
+                    env_id = os.environ.get("CUROBO_SERVICE_ENV", f"sim-{os.getpid()}")
+                    self._curobo = CuroboHttpClient(service_url=curobo_url, env_id=env_id)
+                    print(f"[curobo] Using remote service {curobo_url} (env_id={env_id})")
+                else:
+                    from maniskill_tidyverse.curobo_planner import CuroboPlanner
+                    self._curobo = CuroboPlanner()
+                    print("[curobo] Using in-process planner (set CUROBO_SERVICE_URL to switch)")
+                self._curobo.warmup()
             else:
-                from maniskill_tidyverse.curobo_planner import CuroboPlanner
-                self._curobo = CuroboPlanner()
-                print("[curobo] Using in-process planner (set CUROBO_SERVICE_URL to switch)")
-            self._curobo.warmup()
+                print("[curobo] Reusing warmed planner after scene reset")
 
             if self._fixture_cuboids:
                 # Transform world-frame fixture AABBs to robot-local frame so
@@ -1865,6 +1884,18 @@ class ManiskillServer:
                     except Exception:
                         pass
                     body = _json.dumps(info).encode()
+                    self.send_response(200)
+                elif self.path == "/robot/frame":
+                    # Read the latest physics-thread state without stepping
+                    # the simulator or rendering a new camera frame.
+                    state = server_ref.get_state(env_idx=eidx)
+                    body = _json.dumps({
+                        "arm_base_world_pos": state.robot_world_pos,
+                        "arm_base_world_quat": state.robot_world_quat,
+                        "ee_world_pos": state.ee_world_pos,
+                        "ee_world_quat": state.ee_world_quat,
+                        "timestamp": state.timestamp,
+                    }).encode()
                     self.send_response(200)
                 else:
                     body = b'{"error": "not found"}'
